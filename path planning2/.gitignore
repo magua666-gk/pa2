@@ -1,0 +1,5 @@
+# 忽略整个 models 文件夹
+models/
+
+# 忽略整个 results 文件夹
+results/

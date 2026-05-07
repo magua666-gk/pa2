@@ -1,0 +1,151 @@
+MASAC / SAC 训练与测试命令（所有模式）
+项目根目录（Windows）：d:\pa2\path planning2
+
+============================================================
+0）基础说明
+============================================================
+所有命令均从项目根目录执行：
+cd "d:\pa2\path planning2"
+主入口脚本：
+python main_SAC_curriculum.py
+若路径中包含空格，模型路径需用英文引号包裹。
+测试时智能体数量尽量与训练时保持一致。
+conda activate uav
+
+
+============================================================
+1）训练：课程学习
+============================================================
+
+1.1 课程学习 + 注意力机制（单次运行）
+python main_SAC_curriculum.py --use_curriculum
+
+1.2 课程学习 + 无注意力机制（对比实验）
+python main_SAC_curriculum.py --use_curriculum --disable_attention
+
+1.3 课程学习 + 注意力机制（固定种子多次运行）
+python main_SAC_curriculum.py --use_curriculum --multi_run --num_runs 3 --seeds 42,123,456
+
+1.4 课程学习 + 无注意力机制（固定种子多次运行）
+python main_SAC_curriculum.py --use_curriculum --disable_attention --multi_run --num_runs 3 --seeds 42,123,456
+
+1.5 课程学习 + 注意力机制（随机种子多次运行）
+python main_SAC_curriculum.py --use_curriculum --multi_run --num_runs 3 --random_seed
+
+
+============================================================
+2) 训练：无课程学习（MASAC 后端）
+============================================================
+
+2.1 无课程学习 + 注意力机制 MASAC（默认后端）
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --train_episodes 500 --save_interval 100 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+2.2 无课程学习 + 注意力机制 MASAC + 共享跟随者策略
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --share_follower_policy_no_curriculum --train_episodes 500 --save_interval 100 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+2.3 无课程学习 + 无注意力机制 MASAC（对比实验）
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --disable_attention --train_episodes 500 --save_interval 100 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+2.4 无课程学习 + 注意力机制 MASAC + 自定义输出标签 / 根目录
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --ablation_tag attention_no_curriculum_expA --ablation_output_root "d:\pa2\path planning2" --train_episodes 500 --save_interval 100 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+
+============================================================
+3) 训练：无课程学习（标准 SAC 后端）
+============================================================
+
+3.1 无课程学习 + 标准 SAC
+python main_SAC_curriculum.py --no_curriculum_backend standard_sac --train_episodes 500 --save_interval 100 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+3.2 无课程学习 + 标准 SAC + 自定义标签 / 根目录
+python main_SAC_curriculum.py --no_curriculum_backend standard_sac --ablation_tag standard_sac_no_curriculum_expA --ablation_output_root "d:\pa2\path planning2" --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+
+============================================================
+4) 测试：单一难度
+============================================================
+
+4.1 测试 无课程学习 + 注意力机制 模型
+python main_SAC_curriculum.py --test --no_curriculum_backend attention_masac --model_path "models/attention_no_curriculum_guard/20260420_200042/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 100
+
+4.2 测试 无课程学习 + 注意力机制 模型（共享跟随者策略）
+python main_SAC_curriculum.py --test --no_curriculum_backend attention_masac --share_follower_policy_no_curriculum --model_path "models/attention_no_curriculum_guard/20260420_200042/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 100
+
+4.3 测试 无课程学习 + 无注意力机制 模型
+python main_SAC_curriculum.py --test --no_curriculum_backend attention_masac --disable_attention --model_path "models/no_attention_no_curriculum/20260420_200042/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 100
+
+4.4 测试 课程学习 + 注意力机制 模型
+python main_SAC_curriculum.py --use_curriculum --test --model_path "models/final/final_model" --hero_count 1 --enemy_count 4 --obstacle_count 1 --test_episodes 100
+
+4.5 测试 课程学习 + 无注意力机制 模型
+python main_SAC_curriculum.py --use_curriculum --test --disable_attention --model_path "models/ablation_curriculum_no_attention/final_model" --hero_count 1 --enemy_count 4 --obstacle_count 1 --test_episodes 100
+
+4.6 自定义无人机速度测试
+python main_SAC_curriculum.py --test --model_path "models/final/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 100 --test_speed 1.2
+
+
+============================================================
+5) TESTING: MULTI DIFFICULTY
+============================================================
+
+5.1 多难度测试（自动生成障碍物等级）
+python main_SAC_curriculum.py --multi_difficulty_test --model_path "models/final/final_model" --hero_count 1 --enemy_count 1 --test_episodes 100 --max_obstacle 5 --step_size 1
+
+5.2 多难度测试（指定难度列表）
+python main_SAC_curriculum.py --multi_difficulty_test --model_path "models/final/final_model" --hero_count 1 --enemy_count 1 --test_episodes 100 --test_difficulty "1,2,3,4,5"
+
+5.3 无注意力机制模型的多难度测试
+python main_SAC_curriculum.py --multi_difficulty_test --disable_attention --model_path "models/no_attention_no_curriculum/20260420_200042/final_model" --hero_count 1 --enemy_count 1 --test_episodes 100 --max_obstacle 5 --step_size 1
+
+
+============================================================
+6) 结果 / 工具命令
+============================================================
+
+6.1 生成测试结果索引
+python main_SAC_curriculum.py --create_index
+
+6.2 分析当前结果根目录下所有测试结果
+python main_SAC_curriculum.py --analyze
+
+6.3 分析指定单个结果文件
+python main_SAC_curriculum.py --analyze --result_path "results/test_results/test_YYYYMMDD_HHMMSS_h1_e1_o1/test_results.json"
+
+6.4 强制使用自定义结果根目录（覆盖默认路径）
+python main_SAC_curriculum.py --results_dir "d:\pa2\path planning2\results\manual_results_root" --test --model_path "models/final/final_model"
+
+
+============================================================
+7) 快速验证示例
+============================================================
+
+7.1 快速训练：无课程学习 + 注意力机制
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --train_episodes 20 --save_interval 10 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+7.2 快速测试：匹配 1/1/1 环境配置
+python main_SAC_curriculum.py --test --model_path "models/attention_no_curriculum/20260420_200042/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 10
+
+============================================================
+8) GAT (图注意力机制) 专用命令
+============================================================
+说明：使用 GAT 机制时，必须在训练和测试命令中都加上 `--gat` 参数，以确保网络结构正确实例化并加载相应的权重。
+
+8.1 训练：课程学习 + GAT 机制
+python main_SAC_curriculum.py --use_curriculum --gat
+
+8.2 训练：无课程学习 + GAT 机制
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --gat --train_episodes 500 --save_interval 100 --hero_count 1 --enemy_count 1 --obstacle_count 1
+
+8.3 测试：单一难度 + GAT 模型
+python main_SAC_curriculum.py --test --gat --model_path "models/你的GAT模型路径/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 100
+
+8.4 测试：多难度测试 + GAT 模型
+python main_SAC_curriculum.py --multi_difficulty_test --gat --model_path "models/你的GAT模型路径/final_model" --hero_count 1 --enemy_count 1 --test_episodes 100 --max_obstacle 5 --step_size 1
+
+8.5 快速验证：GAT 机制训练与测试
+# 快速训练10个回合
+python main_SAC_curriculum.py --no_curriculum_backend attention_masac --gat --train_episodes 10 --save_interval 5 --hero_count 1 --enemy_count 1 --obstacle_count 1
+# 快速测试（带渲染观看效果）
+python main_SAC_curriculum.py --test --gat --model_path "models/你的GAT模型路径/final_model" --hero_count 1 --enemy_count 1 --obstacle_count 1 --test_episodes 5 --render
+
+END
