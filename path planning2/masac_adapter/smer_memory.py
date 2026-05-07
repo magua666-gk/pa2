@@ -19,7 +19,7 @@ class SMERMemory:
     Supports dynamic number of followers and outputs padded batch tensors with masks during sampling.
     """
     
-    def __init__(self, capacity: int, obs_dims: Dict[str, int], action_dims: Dict[str, int], device: torch.device, pso_dim: int = 0):
+    def __init__(self, capacity: int, obs_dims: Dict[str, int], action_dims: Dict[str, int], device: torch.device):
         """Initialize SMERMemory
         
         Args:
@@ -33,17 +33,12 @@ class SMERMemory:
         self.obs_dims = obs_dims
         self.action_dims = action_dims
         self.device = device
-        self.pso_dim = int(pso_dim) if pso_dim is not None else 0
         self.memory_counter = 0
         
-        log(
-            f"SMERMemory initialized: capacity={capacity}, obs_dims={obs_dims}, action_dims={action_dims}, pso_dim={self.pso_dim}",
-            LOG_INFO
-        )
+        log(f"SMERMemory initialized: capacity={capacity}, obs_dims={obs_dims}, action_dims={action_dims}", LOG_INFO)
 
-    def store_transition(self, observation: Dict, action: Dict, reward: Dict,
-                        next_observation: Dict, done: bool, stage_tag: str = "default_stage",
-                        pso_features: Optional[np.ndarray] = None, next_pso_features: Optional[np.ndarray] = None):
+    def store_transition(self, observation: Dict, action: Dict, reward: Dict, 
+                        next_observation: Dict, done: bool, stage_tag: str = "default_stage"):
         """Store single transition to experience replay buffer
         
         Args:
@@ -62,9 +57,6 @@ class SMERMemory:
         # 将奖励标准化为统一维度 (1)
         converted_reward = self._validate_and_convert_data(reward, {"leader": 1, "followers": 1})
         
-        pso_current = self._normalize_pso_features(pso_features)
-        pso_next = self._normalize_pso_features(next_pso_features)
-
         # 创建经验元组
         experience = {
             "observation": obs_converted,
@@ -74,10 +66,6 @@ class SMERMemory:
             "done": done,
             "stage_tag": stage_tag  # 新增字段：阶段标签
         }
-
-        if self.pso_dim > 0:
-            experience["pso_features"] = pso_current
-            experience["next_pso_features"] = pso_next
         
         # 添加到缓冲区
         self.buffer.append(experience)
@@ -138,26 +126,6 @@ class SMERMemory:
             converted[key] = value
         
         return converted
-
-    def _normalize_pso_features(self, pso_features: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        """Normalize PSO features into a fixed-size vector."""
-        if self.pso_dim <= 0:
-            return None
-
-        if pso_features is None:
-            return np.zeros((self.pso_dim,), dtype=np.float32)
-
-        pso_arr = np.asarray(pso_features, dtype=np.float32).reshape(-1)
-        pso_arr = np.nan_to_num(pso_arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if pso_arr.size == self.pso_dim:
-            return pso_arr
-
-        result = np.zeros((self.pso_dim,), dtype=np.float32)
-        copy_len = min(self.pso_dim, pso_arr.size)
-        if copy_len > 0:
-            result[:copy_len] = pso_arr[:copy_len]
-        return result
 
     def _pad_and_stack_sequence(self, data_sequences: List[List[np.ndarray]], max_len: int, 
                               feature_dim: int, dtype=np.float32) -> Tuple[np.ndarray, np.ndarray]:
@@ -238,22 +206,6 @@ class SMERMemory:
             return result
         
         return stacked
-
-    def _stack_pso_features(self, pso_list: List[Optional[np.ndarray]]) -> np.ndarray:
-        """Stack PSO feature vectors into a batch."""
-        batch_size = len(pso_list)
-        if self.pso_dim <= 0:
-            return np.zeros((batch_size, 0), dtype=np.float32)
-
-        result = np.zeros((batch_size, self.pso_dim), dtype=np.float32)
-        for i, item in enumerate(pso_list):
-            if item is None:
-                continue
-            pso_arr = self._normalize_pso_features(item)
-            if pso_arr is not None:
-                result[i] = pso_arr
-
-        return result
 
     def sample(self, batch_size: int, current_stage_tag: str = "default_stage", current_stage_number: int = 0) -> Optional[Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]]:
         """从经验回放缓冲区中采样一批经验
@@ -418,15 +370,8 @@ class SMERMemory:
         
         # E. 处理 done 标志
         batch_data["done"] = np.array([exp["done"] for exp in sampled_experiences], dtype=np.float32).reshape(-1, 1)
-
-        # F. Handle PSO features
-        if self.pso_dim > 0:
-            pso_list = [exp.get("pso_features") for exp in sampled_experiences]
-            next_pso_list = [exp.get("next_pso_features") for exp in sampled_experiences]
-            batch_data["pso_features"] = self._stack_pso_features(pso_list)
-            batch_data["next_pso_features"] = self._stack_pso_features(next_pso_list)
         
-        # G. Convert NumPy arrays to PyTorch tensors
+        # F. 将 NumPy 数组转换为 PyTorch 张量
         tensor_batch_data = {}
         tensor_batch_masks = {}
         for key_major, value_major in batch_data.items():

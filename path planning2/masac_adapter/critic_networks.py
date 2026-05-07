@@ -125,7 +125,7 @@ class StructuredAttentionCriticNet(nn.Module):
     
     处理结构化的观测和动作，使用注意力机制聚合信息
     """
-    def __init__(self, state_dim, action_dim, embed_dim=128, n_heads=4, hidden_dims=[256, 128], dropout=0.1, use_attention=True, use_gat=False, pso_dim=0):
+    def __init__(self, state_dim, action_dim, embed_dim=128, n_heads=4, hidden_dims=[256, 128], dropout=0.1, use_attention=True, use_gat=False):
         """初始化结构化注意力 Critic 网络
         
         Args:
@@ -145,7 +145,6 @@ class StructuredAttentionCriticNet(nn.Module):
         self.n_heads = n_heads
         self.use_attention = bool(use_attention)
         self.use_gat = bool(use_gat)
-        self.pso_dim = int(pso_dim) if pso_dim is not None else 0
         
         # 编码器
         self.leader_encoder = CriticObsActEncoder(state_dim, action_dim, embed_dim)
@@ -164,9 +163,9 @@ class StructuredAttentionCriticNet(nn.Module):
         
         # Q 头
         # Leader的输入维度保持不变: embed_dim * 2 (自身编码 + Follower上下文)
-        q_input_dim_leader = embed_dim * 2 + self.pso_dim
+        q_input_dim_leader = embed_dim * 2
         # Follower的输入维度从embed_dim变为embed_dim * 2 (自身编码 + 全局上下文)
-        q_input_dim_follower = embed_dim * 2 + self.pso_dim
+        q_input_dim_follower = embed_dim * 2
         
         self.leader_q_head = QHead(q_input_dim_leader, hidden_dims)
         self.follower_q_head = QHead(q_input_dim_follower, hidden_dims)
@@ -249,39 +248,8 @@ class StructuredAttentionCriticNet(nn.Module):
             )
 
         return leader_context, follower_context
-
-    def _coerce_pso_features(self, pso_features, batch_size, device, dtype):
-        """Normalize PSO features into a [B, pso_dim] tensor."""
-        if self.pso_dim <= 0:
-            return None
-
-        if pso_features is None:
-            return torch.zeros(batch_size, self.pso_dim, device=device, dtype=dtype)
-
-        if torch.is_tensor(pso_features):
-            pso = pso_features.to(device=device, dtype=dtype)
-        else:
-            pso = torch.as_tensor(pso_features, device=device, dtype=dtype)
-
-        if pso.dim() == 1:
-            pso = pso.unsqueeze(0)
-
-        if pso.size(0) != batch_size:
-            if pso.size(0) == 1:
-                pso = pso.expand(batch_size, -1)
-            else:
-                pso = pso[:batch_size]
-
-        if pso.size(1) != self.pso_dim:
-            if pso.size(1) > self.pso_dim:
-                pso = pso[:, :self.pso_dim]
-            else:
-                pad = torch.zeros(batch_size, self.pso_dim - pso.size(1), device=device, dtype=dtype)
-                pso = torch.cat([pso, pad], dim=1)
-
-        return pso
     
-    def forward(self, obs_leader, obs_followers, act_leader, act_followers, mask_followers, pso_features=None):
+    def forward(self, obs_leader, obs_followers, act_leader, act_followers, mask_followers):
         """前向传播
         
         Args:
@@ -290,7 +258,6 @@ class StructuredAttentionCriticNet(nn.Module):
             act_leader: Leader 的动作 [batch_size, action_dim]
             act_followers: Followers 的动作 [batch_size, max_followers, action_dim]
             mask_followers: Followers 的掩码 [batch_size, max_followers]
-            pso_features: Optional PSO feature tensor [batch_size, pso_dim]
             
         Returns:
             q1_leader: Leader 的第一个 Q 值 [batch_size, 1]
@@ -300,7 +267,6 @@ class StructuredAttentionCriticNet(nn.Module):
         """
         B = obs_leader.shape[0]
         max_F = obs_followers.shape[1]
-        pso_features = self._coerce_pso_features(pso_features, B, obs_leader.device, obs_leader.dtype)
         
         # 编码 Leader
         leader_embedding = self.leader_encoder(obs_leader, act_leader)  # [B, E]
@@ -334,8 +300,6 @@ class StructuredAttentionCriticNet(nn.Module):
         
         # 融合Leader自身特征和Follower上下文
         fused_leader_feature = torch.cat([leader_embedding, attn_output], dim=-1)  # [B, E*2]
-        if pso_features is not None:
-            fused_leader_feature = torch.cat([fused_leader_feature, pso_features], dim=-1)
         
         # 计算Leader的Q值
         q1_leader, q2_leader = self.leader_q_head(fused_leader_feature)  # [B, 1], [B, 1]
@@ -376,9 +340,6 @@ class StructuredAttentionCriticNet(nn.Module):
         
         # 融合Follower自身特征和上下文信息
         fused_follower_feature = torch.cat([follower_embeddings, contextual_info_for_followers], dim=-1)  # [B, max_F, 2*E]
-        if pso_features is not None:
-            pso_expanded = pso_features.unsqueeze(1).expand(-1, max_F, -1)
-            fused_follower_feature = torch.cat([fused_follower_feature, pso_expanded], dim=-1)
         
         # 计算Follower的Q值
         q1_followers = torch.zeros(B, max_F, 1, device=obs_leader.device)  # [B, max_F, 1]
@@ -397,7 +358,7 @@ class StructuredAttentionCriticNet(nn.Module):
         
         return q1_leader, q2_leader, q1_followers, q2_followers
     
-    def forward_target(self, obs_leader, obs_followers, act_leader, act_followers, mask_followers, pso_features=None):
+    def forward_target(self, obs_leader, obs_followers, act_leader, act_followers, mask_followers):
         """使用目标网络计算 Q 值
         
         Args:
@@ -406,7 +367,6 @@ class StructuredAttentionCriticNet(nn.Module):
             act_leader: Leader 的动作 [batch_size, action_dim]
             act_followers: Followers 的动作 [batch_size, max_followers, action_dim]
             mask_followers: Followers 的掩码 [batch_size, max_followers]
-            pso_features: Optional PSO feature tensor [batch_size, pso_dim]
             
         Returns:
             q1_leader: Leader 的第一个 Q 值 [batch_size, 1]
@@ -417,7 +377,6 @@ class StructuredAttentionCriticNet(nn.Module):
         with torch.no_grad():
             B = obs_leader.shape[0]
             max_F = obs_followers.shape[1]
-            pso_features = self._coerce_pso_features(pso_features, B, obs_leader.device, obs_leader.dtype)
             
             # 编码 Leader
             leader_embedding = self.target_leader_encoder(obs_leader, act_leader)  # [B, E]
@@ -451,8 +410,6 @@ class StructuredAttentionCriticNet(nn.Module):
             
             # 融合Leader自身特征和Follower上下文
             fused_leader_feature = torch.cat([leader_embedding, attn_output], dim=-1)  # [B, E*2]
-            if pso_features is not None:
-                fused_leader_feature = torch.cat([fused_leader_feature, pso_features], dim=-1)
             
             # 计算Leader的Q值
             q1_leader, q2_leader = self.target_leader_q_head(fused_leader_feature)  # [B, 1], [B, 1]
@@ -492,9 +449,6 @@ class StructuredAttentionCriticNet(nn.Module):
             
             # 融合Follower自身特征和上下文信息
             fused_follower_feature = torch.cat([follower_embeddings, contextual_info_for_followers], dim=-1)  # [B, max_F, 2*E]
-            if pso_features is not None:
-                pso_expanded = pso_features.unsqueeze(1).expand(-1, max_F, -1)
-                fused_follower_feature = torch.cat([fused_follower_feature, pso_expanded], dim=-1)
             
             # 计算Follower的Q值
             q1_followers = torch.zeros(B, max_F, 1, device=obs_leader.device)  # [B, max_F, 1]
