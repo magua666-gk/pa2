@@ -19,7 +19,7 @@ class SMERMemory:
     Supports dynamic number of followers and outputs padded batch tensors with masks during sampling.
     """
     
-    def __init__(self, capacity: int, obs_dims: Dict[str, int], action_dims: Dict[str, int], device: torch.device, pso_dim: int = 0):
+    def __init__(self, capacity: int, obs_dims: Dict[str, int], action_dims: Dict[str, int], device: torch.device):
         """Initialize SMERMemory
         
         Args:
@@ -33,14 +33,12 @@ class SMERMemory:
         self.obs_dims = obs_dims
         self.action_dims = action_dims
         self.device = device
-        self.pso_dim = int(pso_dim) if pso_dim else 0
         self.memory_counter = 0
         
         log(f"SMERMemory initialized: capacity={capacity}, obs_dims={obs_dims}, action_dims={action_dims}", LOG_INFO)
 
     def store_transition(self, observation: Dict, action: Dict, reward: Dict, 
-                        next_observation: Dict, done: bool, stage_tag: str = "default_stage",
-                        pso_features: Optional[np.ndarray] = None, pso_next_features: Optional[np.ndarray] = None):
+                        next_observation: Dict, done: bool, stage_tag: str = "default_stage"):
         """Store single transition to experience replay buffer
         
         Args:
@@ -59,10 +57,6 @@ class SMERMemory:
         # 将奖励标准化为统一维度 (1)
         converted_reward = self._validate_and_convert_data(reward, {"leader": 1, "followers": 1})
         
-        # 处理 PSO 特征 (可选)
-        stored_pso_features = self._validate_pso_features(pso_features)
-        stored_pso_next_features = self._validate_pso_features(pso_next_features)
-
         # 创建经验元组
         experience = {
             "observation": obs_converted,
@@ -70,9 +64,7 @@ class SMERMemory:
             "reward": converted_reward,
             "next_observation": next_obs_converted,
             "done": done,
-            "stage_tag": stage_tag,  # 新增字段：阶段标签
-            "pso_features": stored_pso_features,
-            "pso_features_next": stored_pso_next_features
+            "stage_tag": stage_tag  # 新增字段：阶段标签
         }
         
         # 添加到缓冲区
@@ -215,39 +207,6 @@ class SMERMemory:
         
         return stacked
 
-    def _validate_pso_features(self, pso_features: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        """Validate and normalize PSO feature vectors."""
-        if self.pso_dim <= 0:
-            return None
-
-        if pso_features is None:
-            return np.zeros(self.pso_dim, dtype=np.float32)
-
-        arr = np.asarray(pso_features, dtype=np.float32).reshape(-1)
-        if arr.size >= self.pso_dim:
-            return arr[:self.pso_dim]
-
-        padded = np.zeros(self.pso_dim, dtype=np.float32)
-        padded[:arr.size] = arr
-        return padded
-
-    def _stack_pso_features(self, pso_list: List[Optional[np.ndarray]]) -> np.ndarray:
-        """Stack PSO feature vectors into a batch tensor."""
-        batch_size = len(pso_list)
-        stacked = np.zeros((batch_size, self.pso_dim), dtype=np.float32)
-        if self.pso_dim <= 0:
-            return stacked
-
-        for i, item in enumerate(pso_list):
-            if item is None:
-                continue
-            arr = np.asarray(item, dtype=np.float32).reshape(-1)
-            if arr.size >= self.pso_dim:
-                stacked[i] = arr[:self.pso_dim]
-            elif arr.size > 0:
-                stacked[i, :arr.size] = arr
-        return stacked
-
     def sample(self, batch_size: int, current_stage_tag: str = "default_stage", current_stage_number: int = 0) -> Optional[Tuple[Dict[str, Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]]:
         """从经验回放缓冲区中采样一批经验
         
@@ -346,15 +305,7 @@ class SMERMemory:
                    max_followers = max(max_followers, len(exp["observation"]["followers"]))
         
         # B. 初始化 batch_data 和 batch_masks
-        batch_data = {
-            "observation": {},
-            "action": {},
-            "reward": {},
-            "next_observation": {},
-            "done": None,
-            "pso_features": None,
-            "pso_features_next": None
-        }
+        batch_data = {"observation": {}, "action": {}, "reward": {}, "next_observation": {}, "done": None}
         batch_masks = {}
         
         # 获取实际采样到的批次大小
@@ -419,20 +370,8 @@ class SMERMemory:
         
         # E. 处理 done 标志
         batch_data["done"] = np.array([exp["done"] for exp in sampled_experiences], dtype=np.float32).reshape(-1, 1)
-
-        # F. 处理 PSO 特征
-        if self.pso_dim > 0:
-            batch_data["pso_features"] = self._stack_pso_features(
-                [exp.get("pso_features") for exp in sampled_experiences]
-            )
-            batch_data["pso_features_next"] = self._stack_pso_features(
-                [exp.get("pso_features_next") for exp in sampled_experiences]
-            )
-        else:
-            batch_data["pso_features"] = np.zeros((actual_sampled_batch_size, 0), dtype=np.float32)
-            batch_data["pso_features_next"] = np.zeros((actual_sampled_batch_size, 0), dtype=np.float32)
         
-        # G. 将 NumPy 数组转换为 PyTorch 张量
+        # F. 将 NumPy 数组转换为 PyTorch 张量
         tensor_batch_data = {}
         tensor_batch_masks = {}
         for key_major, value_major in batch_data.items():
