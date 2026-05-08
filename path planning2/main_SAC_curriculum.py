@@ -28,6 +28,7 @@ from masac_adapter.smer_memory import SMERMemory
 # Import new Actor and Critic networks
 from masac_adapter.actor_networks import LeaderActorNet, FollowerActorNet, AttentionLeaderActorNet, AttentionFollowerActorNet
 from masac_adapter.critic_networks import StructuredAttentionCriticNet
+from masac_adapter.pso_features import PSOFeatureExtractor
 # Import curriculum learning manager
 from curriculum import CurriculumManager, FixedTaskGenerator, CurriculumConfig, LinearTaskSequencer,PolicyTransfer
 # ==============================================================================
@@ -72,7 +73,7 @@ class MASACController:
                  hidden_dim=256, target_update_interval=2, reward_scale=0.1,
                  auto_entropy=True, entropy_lr=3e-4, target_entropy=-0.1, device=None,
                  memory_capacity=None, max_replay_ratio=10.0, share_follower_policy=False, use_attention=True,
-                 use_gat=False):  # Add max_replay_ratio parameter
+                 use_gat=False, pso_feature_dim=0):  # Add max_replay_ratio parameter
         """Initialize role-based MASAC controller
         
         Args:
@@ -96,6 +97,7 @@ class MASACController:
             max_replay_ratio: Maximum replay ratio, limiting upper bound for set_replay_ratio
             share_follower_policy: Whether all followers share the same actor policy
             use_attention: Whether to enable attention-based actor/critic modules
+            pso_feature_dim: Dimension of PSO feature vector appended to Critic inputs
         """
         self.n_agents = n_agents
         self.state_dim = state_dim
@@ -111,6 +113,7 @@ class MASACController:
         self.share_follower_policy = bool(share_follower_policy)
         self.use_attention = bool(use_attention)
         self.use_gat = bool(use_gat)
+        self.pso_feature_dim = int(pso_feature_dim) if pso_feature_dim is not None else 0
 
         # Save actor architecture config for dynamic follower expansion.
         self.actor_embed_dim = 128
@@ -139,7 +142,8 @@ class MASACController:
             capacity=memory_size,
             obs_dims=obs_dims,
             action_dims=action_dims,
-            device=self.device
+            device=self.device,
+            pso_dim=self.pso_feature_dim
         )
         
         # Record current agent count version for replay buffer
@@ -263,7 +267,8 @@ class MASACController:
         self.critic = StructuredAttentionCriticNet(
             state_dim=state_dim, action_dim=action_dim, embed_dim=embed_dim,
             n_heads=n_heads, hidden_dims=critic_hidden_dims, dropout=dropout,
-            use_attention=self.use_attention, use_gat=self.use_gat
+            use_attention=self.use_attention, use_gat=self.use_gat,
+            pso_dim=self.pso_feature_dim
         )
         
         # === Initialize entropy adjustment ===
@@ -357,7 +362,8 @@ class MASACController:
             capacity=self.memory_capacity,
             obs_dims=obs_dims,
             action_dims=action_dims,
-            device=self.device
+            device=self.device,
+            pso_dim=self.pso_feature_dim
         )
         print(f"Reset SMERMemory buffer, capacity: {self.memory_capacity}")
         
@@ -524,11 +530,11 @@ class MASACController:
         
         self.critic = self.critic.to(device)
         if hasattr(self.entroy_leader, 'log_alpha') and torch.is_tensor(self.entroy_leader.log_alpha):
-            self.entroy_leader.log_alpha = self.entroy_leader.log_alpha.to(device)
-            self.entroy_leader.alpha = self.entroy_leader.alpha.to(device)
+            self.entroy_leader.log_alpha.data = self.entroy_leader.log_alpha.data.to(device)
+            self.entroy_leader.alpha = self.entroy_leader.log_alpha.exp()
         if hasattr(self.entroy_follower, 'log_alpha') and torch.is_tensor(self.entroy_follower.log_alpha):
-            self.entroy_follower.log_alpha = self.entroy_follower.log_alpha.to(device)
-            self.entroy_follower.alpha = self.entroy_follower.alpha.to(device)
+            self.entroy_follower.log_alpha.data = self.entroy_follower.log_alpha.data.to(device)
+            self.entroy_follower.alpha = self.entroy_follower.log_alpha.exp()
         
         # Move optimizer state
         optimizers_to_move = [
@@ -858,7 +864,8 @@ class MASACController:
                 "followers": follower_actions
             }
     
-    def store_transition(self, states, actions, rewards, next_states, done=False, current_stage_tag: str = "default_stage"):
+    def store_transition(self, states, actions, rewards, next_states, done=False, current_stage_tag: str = "default_stage",
+                         pso_features=None, next_pso_features=None):
         """Store transition to replay buffer
         
         Args:
@@ -885,6 +892,20 @@ class MASACController:
                 val = float(np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0))
                 return float(np.clip(val, -1000.0, 1000.0))
 
+            def _clean_pso(x):
+                if self.pso_feature_dim <= 0:
+                    return None
+                if x is None:
+                    return np.zeros((self.pso_feature_dim,), dtype=np.float32)
+                arr = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+                if arr.size == self.pso_feature_dim:
+                    return arr
+                result = np.zeros((self.pso_feature_dim,), dtype=np.float32)
+                copy_len = min(self.pso_feature_dim, arr.size)
+                if copy_len > 0:
+                    result[:copy_len] = arr[:copy_len]
+                return result
+
             observation = {
                 "leader": _clean_state(states["leader"]),
                 "followers": [_clean_state(item) for item in states.get("followers", [])]
@@ -902,7 +923,19 @@ class MASACController:
                 "followers": [_clean_state(item) for item in next_states.get("followers", [])]
             }
 
-            self.memory.store_transition(observation, action, reward, next_observation, bool(done), stage_tag=current_stage_tag)
+            pso_current = _clean_pso(pso_features)
+            pso_next = _clean_pso(next_pso_features)
+
+            self.memory.store_transition(
+                observation,
+                action,
+                reward,
+                next_observation,
+                bool(done),
+                stage_tag=current_stage_tag,
+                pso_features=pso_current,
+                next_pso_features=pso_next
+            )
             return
             
         states = np.nan_to_num(np.asarray(states, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -934,8 +967,52 @@ class MASACController:
         action = {"leader": leader_action, "followers": list(follower_actions)}
         reward = {"leader": leader_reward, "followers": list(follower_rewards)}
         next_observation = {"leader": leader_next_state, "followers": list(follower_next_states)}
-        
-        self.memory.store_transition(observation, action, reward, next_observation, done, stage_tag=current_stage_tag)
+
+        pso_current = None
+        pso_next = None
+        if self.pso_feature_dim > 0:
+            if pso_features is None:
+                pso_current = np.zeros((self.pso_feature_dim,), dtype=np.float32)
+            else:
+                pso_current = np.nan_to_num(
+                    np.asarray(pso_features, dtype=np.float32),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0
+                ).reshape(-1)
+
+            if next_pso_features is None:
+                pso_next = np.zeros((self.pso_feature_dim,), dtype=np.float32)
+            else:
+                pso_next = np.nan_to_num(
+                    np.asarray(next_pso_features, dtype=np.float32),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0
+                ).reshape(-1)
+
+            def _fit_pso(arr):
+                if arr.size == self.pso_feature_dim:
+                    return arr
+                result = np.zeros((self.pso_feature_dim,), dtype=np.float32)
+                copy_len = min(self.pso_feature_dim, arr.size)
+                if copy_len > 0:
+                    result[:copy_len] = arr[:copy_len]
+                return result
+
+            pso_current = _fit_pso(pso_current)
+            pso_next = _fit_pso(pso_next)
+
+        self.memory.store_transition(
+            observation,
+            action,
+            reward,
+            next_observation,
+            done,
+            stage_tag=current_stage_tag,
+            pso_features=pso_current,
+            next_pso_features=pso_next
+        )
     
     def train(self, batch_size=None, current_stage_tag: str = "default_stage", current_stage_number: int = 0):
         """Train networks
@@ -966,6 +1043,36 @@ class MASACController:
             self.last_train_status = train_status
             return train_status
 
+        def _coerce_pso_batch(pso_tensor, batch_size):
+            if self.pso_feature_dim <= 0:
+                return None
+            if pso_tensor is None:
+                return torch.zeros(batch_size, self.pso_feature_dim, device=self.device)
+            if not torch.is_tensor(pso_tensor):
+                pso_tensor = torch.as_tensor(pso_tensor, dtype=torch.float32, device=self.device)
+            else:
+                pso_tensor = pso_tensor.to(self.device)
+
+            pso_tensor = torch.nan_to_num(pso_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+            pso_tensor = pso_tensor.clamp(-10.0, 10.0)
+            if pso_tensor.dim() == 1:
+                pso_tensor = pso_tensor.unsqueeze(0)
+
+            if pso_tensor.size(0) != batch_size:
+                if pso_tensor.size(0) == 1:
+                    pso_tensor = pso_tensor.expand(batch_size, -1)
+                else:
+                    pso_tensor = pso_tensor[:batch_size]
+
+            if pso_tensor.size(1) != self.pso_feature_dim:
+                if pso_tensor.size(1) > self.pso_feature_dim:
+                    pso_tensor = pso_tensor[:, :self.pso_feature_dim]
+                else:
+                    pad = torch.zeros(batch_size, self.pso_feature_dim - pso_tensor.size(1), device=self.device)
+                    pso_tensor = torch.cat([pso_tensor, pad], dim=1)
+
+            return pso_tensor
+
         sampled_data = self.memory.sample(
             batch_size,
             current_stage_tag=current_stage_tag,
@@ -993,6 +1100,10 @@ class MASACController:
         next_obs_followers = batch_data["next_observation"]["followers"]
         
         done = batch_data["done"]
+        pso_features = batch_data.get("pso_features")
+        next_pso_features = batch_data.get("next_pso_features")
+        if next_pso_features is None:
+            next_pso_features = pso_features
 
         # Sanitize sampled tensors to avoid NaN/Inf poisoning training.
         obs_leader = torch.nan_to_num(obs_leader, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1e4, 1e4)
@@ -1009,6 +1120,9 @@ class MASACController:
         B, max_F, _ = obs_followers.shape
         self._ensure_follower_capacity(max_F)
         num_active_followers = max_F
+
+        pso_features = _coerce_pso_batch(pso_features, B)
+        next_pso_features = _coerce_pso_batch(next_pso_features, B)
         
         # ===== Calculate Critic loss =====
         # 1. Calculate target Q value
@@ -1105,7 +1219,8 @@ class MASACController:
             target_q1_leader, target_q2_leader, target_q1_followers, target_q2_followers = self.critic.forward_target(
                 next_obs_leader, next_obs_followers, 
                 next_act_leader, next_act_followers,
-                mask_followers
+                mask_followers,
+                pso_features=next_pso_features
             )
             
             # Use min Q
@@ -1127,7 +1242,8 @@ class MASACController:
         current_q1_leader, current_q2_leader, current_q1_followers, current_q2_followers = self.critic(
             obs_leader, obs_followers,
             act_leader, act_followers,
-            mask_followers
+            mask_followers,
+            pso_features=pso_features
         )
         
         # 3. Calculate Critic loss (MSE)
@@ -1184,7 +1300,8 @@ class MASACController:
         q1_leader, q2_leader, _, _ = self.critic(
             obs_leader, obs_followers,
             new_act_leader, act_followers,  # Use new Leader action, keep Followers actions unchanged
-            mask_followers
+            mask_followers,
+            pso_features=pso_features
         )
         min_q_leader = torch.min(q1_leader, q2_leader)
         
@@ -1278,7 +1395,8 @@ class MASACController:
         _, _, q1_followers, q2_followers = self.critic(
             obs_leader, obs_followers,
             act_leader, new_act_followers,  # Use new Followers actions, keep Leader action unchanged
-            mask_followers
+            mask_followers,
+            pso_features=pso_features
         )
         min_q_followers = torch.min(q1_followers, q2_followers)
         
@@ -1420,7 +1538,8 @@ class MASACController:
             'replay_ratio': self.replay_ratio,
             'share_follower_policy': self.share_follower_policy,
             'use_attention': self.use_attention,
-            'use_gat': self.use_gat
+            'use_gat': self.use_gat,
+            'pso_feature_dim': self.pso_feature_dim
         }, path)
         
         print(f"Model saved to {path}")
@@ -1464,6 +1583,15 @@ class MASACController:
             if checkpoint_use_gat is not None and bool(checkpoint_use_gat) != getattr(self, 'use_gat', False):
                 print(f"Info: checkpoint use_gat={bool(checkpoint_use_gat)}, "
                       f"runtime use_gat={getattr(self, 'use_gat', False)}. Keeping runtime setting.")
+
+            checkpoint_pso_dim = checkpoint.get('pso_feature_dim', 0)
+            skip_critic = False
+            if int(checkpoint_pso_dim) != int(self.pso_feature_dim):
+                print(
+                    f"Warning: checkpoint pso_feature_dim={checkpoint_pso_dim}, "
+                    f"runtime pso_feature_dim={self.pso_feature_dim}. Skipping critic load."
+                )
+                skip_critic = True
             
             # Load Actor network parameters
             self.leader_actor.load_state_dict(checkpoint['leader_actor'], strict=strict)
@@ -1516,13 +1644,22 @@ class MASACController:
             self._sync_shared_follower_policy_weights()
             
             # Load Critic network parameters
-            self.critic.load_state_dict(checkpoint['critic'], strict=strict)
+            if not skip_critic and 'critic' in checkpoint:
+                self.critic.load_state_dict(checkpoint['critic'], strict=strict)
+            elif skip_critic:
+                print("Info: Critic load skipped due to PSO feature dimension mismatch.")
             
             # Load entropy parameters
             if 'entroy_leader' in checkpoint:
                 # Handle tensors
                 for key, value in checkpoint['entroy_leader'].items():
-                    if isinstance(value, torch.Tensor):
+                    if key == 'log_alpha' and isinstance(value, torch.Tensor):
+                        if hasattr(self.entroy_leader, 'log_alpha') and self.entroy_leader.log_alpha is not None:
+                            self.entroy_leader.log_alpha.data.copy_(value.to(self.device))
+                        else:
+                            self.entroy_leader.log_alpha = nn.Parameter(value.detach().to(self.device))
+                        self.entroy_leader.alpha = self.entroy_leader.log_alpha.exp()
+                    elif isinstance(value, torch.Tensor):
                         setattr(self.entroy_leader, key, value.to(self.device))
                     else:
                         setattr(self.entroy_leader, key, value)
@@ -1530,7 +1667,13 @@ class MASACController:
             if 'entroy_follower' in checkpoint:
                 # Handle tensors
                 for key, value in checkpoint['entroy_follower'].items():
-                    if isinstance(value, torch.Tensor):
+                    if key == 'log_alpha' and isinstance(value, torch.Tensor):
+                        if hasattr(self.entroy_follower, 'log_alpha') and self.entroy_follower.log_alpha is not None:
+                            self.entroy_follower.log_alpha.data.copy_(value.to(self.device))
+                        else:
+                            self.entroy_follower.log_alpha = nn.Parameter(value.detach().to(self.device))
+                        self.entroy_follower.alpha = self.entroy_follower.log_alpha.exp()
+                    elif isinstance(value, torch.Tensor):
                         setattr(self.entroy_follower, key, value.to(self.device))
                     else:
                         setattr(self.entroy_follower, key, value)
@@ -1550,7 +1693,7 @@ class MASACController:
                     'follower_actor_optimizer'
                 )
                 
-            if 'critic_optimizer' in checkpoint:
+            if not skip_critic and 'critic_optimizer' in checkpoint:
                 self._safe_load_optimizer_state(
                     self.critic_optimizer,
                     checkpoint['critic_optimizer'],
@@ -1687,7 +1830,8 @@ class MASACController:
                 }
             },
             'critic': self.critic.state_dict(), # Export Critic parameters
-            'num_follower_actors': len(self.follower_actors)  # Add follower Actor count information
+            'num_follower_actors': len(self.follower_actors),  # Add follower Actor count information
+            'pso_feature_dim': self.pso_feature_dim
         }
         log("Exported parameters for curriculum transfer from MASACController (includes Critic and multiple Follower Actors)", LOG_DEBUG)
         return params
@@ -1745,9 +1889,9 @@ class MASACController:
                     leader_entropy = entropy_params['entropy_0']
                     for key, value in leader_entropy.items():
                         if key == 'log_alpha' and isinstance(value, torch.Tensor):
-                            # 确保log_alpha保留梯度信息
+                            # Ensure log_alpha stays as a leaf parameter
                             if not hasattr(self.entroy_leader, 'log_alpha') or self.entroy_leader.log_alpha is None:
-                                self.entroy_leader.log_alpha = value.clone().to(self.device).requires_grad_(True)
+                                self.entroy_leader.log_alpha = nn.Parameter(value.detach().to(self.device))
                             else:
                                 self.entroy_leader.log_alpha.data.copy_(value.to(self.device))
                         elif isinstance(value, torch.Tensor):
@@ -1764,9 +1908,9 @@ class MASACController:
                     follower_entropy = entropy_params['entropy_1']
                     for key, value in follower_entropy.items():
                         if key == 'log_alpha' and isinstance(value, torch.Tensor):
-                            # 确保log_alpha保留梯度信息
+                            # Ensure log_alpha stays as a leaf parameter
                             if not hasattr(self.entroy_follower, 'log_alpha') or self.entroy_follower.log_alpha is None:
-                                self.entroy_follower.log_alpha = value.clone().to(self.device).requires_grad_(True)
+                                self.entroy_follower.log_alpha = nn.Parameter(value.detach().to(self.device))
                             else:
                                 self.entroy_follower.log_alpha.data.copy_(value.to(self.device))
                         elif isinstance(value, torch.Tensor):
@@ -1780,8 +1924,15 @@ class MASACController:
             
             # 更新 Critic 参数
             if 'critic' in transferred_params:
-                self.critic.load_state_dict(transferred_params['critic'])
-                updated_components.append("Critic")
+                transferred_pso_dim = int(transferred_params.get('pso_feature_dim', self.pso_feature_dim))
+                if transferred_pso_dim != self.pso_feature_dim:
+                    log(
+                        f"Skip critic transfer: pso_feature_dim mismatch (source={transferred_pso_dim}, target={self.pso_feature_dim})",
+                        LOG_WARNING
+                    )
+                else:
+                    self.critic.load_state_dict(transferred_params['critic'])
+                    updated_components.append("Critic")
             
             log(f"已成功更新MASACController组件: {', '.join(updated_components)}", LOG_INFO)
             
@@ -2266,6 +2417,8 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
     # 训练模式下设置dt=1.0
     env.set_time_step(1.0)
     print(f"训练模式：时间步长dt设置为1.0")
+
+    pso_extractor = PSOFeatureExtractor()
     
     # 创建MASAC控制器
     n_agents = initial_n_agent + initial_m_enemy
@@ -2284,7 +2437,8 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         memory_capacity=MemoryCapacity,
         max_replay_ratio=20,  # 允许较高的重放比例以减轻过拟合
         use_attention=use_attention,
-        use_gat = use_gat
+        use_gat=use_gat,
+        pso_feature_dim=pso_extractor.feature_dim
     )
     
     # 添加奖励分配验证函数
@@ -2500,6 +2654,8 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
                 # 2. 动态衰减噪声比例：前期大步试错 (0.1)，后期精细微调 (逐步降至 0.02)
                 current_noise_scale = 0.1 * max(0.2, 1.0 - (episode / max_ep))
 
+                pso_features = pso_extractor.extract_from_env(env)
+
                 # 选择动作
                 action = masac_controller.select_actions(
                     observation,
@@ -2510,11 +2666,19 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
                 
                 # 执行动作
                 observation_, reward, done, win, team_counter, dis = env.step(action)
+
+                next_pso_features = pso_extractor.extract_from_env(env)
                 
                 # 存储经验到回放缓冲区，传递阶段标签
                 masac_controller.store_transition(
-                    observation, action, reward, observation_, done,
-                    current_stage_tag=current_stage_tag_for_memory
+                    observation,
+                    action,
+                    reward,
+                    observation_,
+                    done,
+                    current_stage_tag=current_stage_tag_for_memory,
+                    pso_features=pso_features,
+                    next_pso_features=next_pso_features
                 )
                 
                 # 记录最后一步的距离
@@ -3106,6 +3270,7 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
         ).unwrapped
         env.set_time_step(1.0)
         print("训练模式：时间步长dt设置为1.0")
+        pso_extractor = PSOFeatureExtractor()
         masac_controller = MASACController(
             n_agents=n_agents,
             state_dim=state_dim,
@@ -3115,7 +3280,8 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
             max_replay_ratio=20,
             share_follower_policy=share_follower_policy,
             use_attention=use_attention,
-            use_gat=use_gat
+            use_gat=use_gat,
+            pso_feature_dim=pso_extractor.feature_dim
         )
 
         training_start_size = int(MemoryCapacity * training_start_ratio)
@@ -3133,6 +3299,7 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
 
             while not done and step_count < EP_LEN:
                 should_add_noise = episode < exploration_episodes
+                pso_features = pso_extractor.extract_from_env(env)
                 action = masac_controller.select_actions(
                     observation,
                     add_noise=should_add_noise,
@@ -3141,6 +3308,7 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
                 )
 
                 observation_, reward, done, win, team_counter, dis = env.step(action)
+                next_pso_features = pso_extractor.extract_from_env(env)
 
                 masac_controller.store_transition(
                     observation,
@@ -3148,7 +3316,9 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
                     reward,
                     observation_,
                     done,
-                    current_stage_tag="no_curriculum"
+                    current_stage_tag="no_curriculum",
+                    pso_features=pso_features,
+                    next_pso_features=next_pso_features
                 )
 
                 step_total_reward, leader_r, follower1_r = _extract_reward_components(reward)
