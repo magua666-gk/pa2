@@ -1102,35 +1102,85 @@ class TypeAwareActor:
 
 
 class MASACEntroy():
-    def __init__(self, action_dim=2):
+    DEFAULT_TARGET_ENTROPY_SCALE = 2.0
+    DEFAULT_INITIAL_ALPHA = 0.2
+    DEFAULT_MIN_ALPHA = 0.01
+    DEFAULT_MAX_ALPHA = 0.3
+
+    def __init__(self, action_dim=2, target_entropy=None, initial_alpha=None,
+                 min_alpha=None, max_alpha=None):
         """初始化温度系数管理器
         
         Args:
             action_dim: 动作维度，用于计算初始的目标熵
+            target_entropy: 目标熵；None 时使用低探索默认值
+            initial_alpha: 初始温度系数
+            min_alpha: alpha 下限
+            max_alpha: alpha 上限
         """
-        # 基于动作空间大小动态设置目标熵
-        # 对于连续动作空间，一个常用启发式是 -dim(A)，即动作空间的负维度
-        self.target_entropy = -float(action_dim)
+        self.action_dim = action_dim
+        self.min_alpha = float(self.DEFAULT_MIN_ALPHA if min_alpha is None else min_alpha)
+        self.max_alpha = float(self.DEFAULT_MAX_ALPHA if max_alpha is None else max_alpha)
+        if self.min_alpha <= 0 or self.max_alpha <= self.min_alpha:
+            raise ValueError(f"Invalid alpha bounds: min_alpha={self.min_alpha}, max_alpha={self.max_alpha}")
+
+        # 编队控制需要低随机性；目标熵比 SAC 常用的 -dim(A) 更低，避免 alpha 被持续拉高。
+        if target_entropy is None:
+            self.target_entropy = -self.DEFAULT_TARGET_ENTROPY_SCALE * float(action_dim)
+        else:
+            self.target_entropy = float(target_entropy)
         
-        # 初始化为保守的alpha值，确保在训练初期有足够的探索
-        self.initial_alpha = 1
+        # 使用较小初值，保留自动调节能力，但不在训练初期制造过强探索。
+        default_initial_alpha = self.DEFAULT_INITIAL_ALPHA if initial_alpha is None else initial_alpha
+        self.initial_alpha = float(np.clip(default_initial_alpha, self.min_alpha, self.max_alpha))
         
         # 创建可学习的log_alpha参数 (leaf tensor)
         self.log_alpha = nn.Parameter(
             torch.tensor([float(np.log(self.initial_alpha))], dtype=torch.float32)
         )
-        self.alpha = self.log_alpha.exp()
+        self.alpha = None
+        self._sync_alpha()
         
         # 小一点的学习率，使得alpha的更新更平滑
         self.optimizer = torch.optim.Adam([self.log_alpha], lr=3e-4)
         
-        # 设置允许的alpha值范围
-        self.min_alpha = 0.01  # 最小alpha值
-        self.max_alpha = 1.0  # 最大alpha值
-        
         # 监控数据
         self.alpha_history = []
         self.entropy_history = []
+
+    def _sync_alpha(self):
+        """根据 log_alpha 同步无梯度 alpha 缓存。"""
+        self.alpha = self.log_alpha.detach().exp().clamp(self.min_alpha, self.max_alpha)
+        return self.alpha
+
+    def clamp_alpha(self, warn=False):
+        """将 log_alpha/alpha 都限制在配置范围内。"""
+        raw_alpha = self.log_alpha.detach().exp().item()
+        with torch.no_grad():
+            self.log_alpha.clamp_(float(np.log(self.min_alpha)), float(np.log(self.max_alpha)))
+        self._sync_alpha()
+        limited_alpha = self.alpha.item()
+        if warn and abs(raw_alpha - limited_alpha) > 1e-8:
+            log(
+                f"Alpha值超出范围[{self.min_alpha}, {self.max_alpha}]，从{raw_alpha:.4f}限制为{limited_alpha:.4f}",
+                LOG_WARNING,
+                throttle=100
+            )
+        return limited_alpha
+
+    def set_alpha(self, alpha_value):
+        """安全设置 alpha，并保持 log_alpha 是 leaf Parameter。"""
+        limited_alpha = float(np.clip(alpha_value, self.min_alpha, self.max_alpha))
+        with torch.no_grad():
+            self.log_alpha.copy_(
+                torch.tensor(
+                    [float(np.log(limited_alpha))],
+                    dtype=self.log_alpha.dtype,
+                    device=self.log_alpha.device
+                )
+            )
+        self._sync_alpha()
+        return limited_alpha
     
     def update_target_entropy(self, new_target):
         """更新目标熵
@@ -1139,7 +1189,7 @@ class MASACEntroy():
             new_target: 新的目标熵值
         """
         old_target = self.target_entropy
-        self.target_entropy = new_target
+        self.target_entropy = float(new_target)
         return old_target, new_target
     
     def learn(self, entroy_loss):
@@ -1155,22 +1205,11 @@ class MASACEntroy():
         loss = entroy_loss
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
         self.optimizer.step()
         
         # 更新alpha值并限制在合理范围内
-        self.alpha = self.log_alpha.exp()
-        
-        # 限制alpha在有效范围内（直接裁剪）
-        alpha_value = self.alpha.item()
-        if alpha_value < self.min_alpha or alpha_value > self.max_alpha:
-            # 记录过大/过小的值
-            limited_alpha = max(min(alpha_value, self.max_alpha), self.min_alpha)
-            log(f"Alpha值超出范围[{self.min_alpha}, {self.max_alpha}]，从{alpha_value:.4f}限制为{limited_alpha:.4f}", LOG_WARNING, throttle=100)
-            
-            # 手动设置限制后的alpha
-            with torch.no_grad():
-                self.log_alpha[:] = torch.log(torch.tensor(limited_alpha))
-            self.alpha = self.log_alpha.exp()
+        self.clamp_alpha(warn=True)
         
         # 记录历史
         self.alpha_history.append(self.alpha.item())
