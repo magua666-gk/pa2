@@ -1110,7 +1110,7 @@ class MASACEntroy():
         """
         # 基于动作空间大小动态设置目标熵
         # 对于连续动作空间，一个常用启发式是 -dim(A)，即动作空间的负维度
-        self.target_entropy = -2
+        self.target_entropy = -float(action_dim)
         
         # 初始化为保守的alpha值，确保在训练初期有足够的探索
         self.initial_alpha = 1

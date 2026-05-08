@@ -7,6 +7,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import os
 import pickle as pkl
+from pso_features import PSOFeatureGenerator
 shoplistfile = 'D:/pa2/path planning2/MASAC_new1'
 shoplistfile_test = 'D:/pa2/path planning2/MASAC_d_test2'
 shoplistfile_test1 = 'D:/pa2/path planning2/MASAC_compare'
@@ -64,6 +65,7 @@ BATCH = 256
 tau = 1e-2
 MemoryCapacity=50000
 Switch=1
+PSO_FEATURE_DIM = 0
 class Ornstein_Uhlenbeck_Noise:
     def __init__(self, mu, sigma=0.1, theta=0.1, dt=1e-2, x0=None):
         self.theta = theta
@@ -227,7 +229,8 @@ class Entroy():
 
 class Critic():
     def __init__(self):
-        self.critic_v,self.target_critic_v=CriticNet(state_number*(N_Agent+M_Enemy),action_number),CriticNet(state_number*(N_Agent+M_Enemy),action_number)
+        state_dim_total = state_number * (N_Agent + M_Enemy) + PSO_FEATURE_DIM
+        self.critic_v,self.target_critic_v=CriticNet(state_dim_total,action_number),CriticNet(state_dim_total,action_number)
         self.target_critic_v.load_state_dict(self.critic_v.state_dict())
         self.optimizer = torch.optim.Adam(self.critic_v.parameters(), lr=value_lr,eps=1e-5)
         self.lossfunc = nn.MSELoss()
@@ -324,6 +327,12 @@ def run(env):
         print('SAC Testing...')
         
     if Switch==1:
+        pso_generator = PSOFeatureGenerator()
+        global PSO_FEATURE_DIM
+        PSO_FEATURE_DIM = int(pso_generator.feature_dim)
+        state_dim_total = state_number * (N_Agent + M_Enemy) + PSO_FEATURE_DIM
+        reward_dim_total = 1 * (N_Agent + M_Enemy)
+
         all_ep_r = [[] for i in range(TRAIN_NUM)]
         all_ep_r0 = [[] for i in range(TRAIN_NUM)]
         all_ep_r1 = [[] for i in range(TRAIN_NUM)]
@@ -335,13 +344,18 @@ def run(env):
                 actors[i] = Actor()
                 critics[i] = Critic()
                 entroys[i] = Entroy()
-            M = Memory(MemoryCapacity, 2 * state_number*(N_Agent+M_Enemy) + action_number*(N_Agent+M_Enemy) + 1*(N_Agent+M_Enemy))
+            M = Memory(
+                MemoryCapacity,
+                2 * state_dim_total + action_number * (N_Agent + M_Enemy) + reward_dim_total
+            )
             ou_noise = Ornstein_Uhlenbeck_Noise(mu=np.zeros(((N_Agent+M_Enemy), action_number)))
             action=np.zeros(((N_Agent+M_Enemy), action_number))
             for episode in range(EP_MAX):
                 observation = _observation_to_array(env.reset())
+                pso_generator.reset()
                 reward_totle,reward_totle0,reward_totle1 = 0,0,0
                 for timestep in range(EP_LEN):
+                    pso_features = pso_generator.compute_from_env(env)
                     for i in range(N_Agent+M_Enemy):
                         action[i] = actors[i].choose_action(observation[i], evaluate=False)
                     if episode <= 20:
@@ -353,14 +367,18 @@ def run(env):
                     observation_, reward, done, win, team_counter, dis = env.step(action)
                     observation_ = _observation_to_array(observation_)
                     reward = _reward_to_array(reward)
-                    M.store_transition(observation.flatten(), action.flatten(), reward.flatten(), observation_.flatten())
+                    pso_features_next = pso_generator.compute_from_env(env)
+
+                    state_with_pso = np.hstack((observation.flatten(), pso_features))
+                    next_state_with_pso = np.hstack((observation_.flatten(), pso_features_next))
+                    M.store_transition(state_with_pso, action.flatten(), reward.flatten(), next_state_with_pso)
                     
                     if M.memory_counter > MemoryCapacity:
                         b_M = M.sample(BATCH)
-                        b_s = b_M[:, :state_number*(N_Agent+M_Enemy)]
-                        b_a = b_M[:, state_number*(N_Agent+M_Enemy): state_number*(N_Agent+M_Enemy) + action_number*(N_Agent+M_Enemy)]
-                        b_r = b_M[:, -state_number*(N_Agent+M_Enemy) - 1*(N_Agent+M_Enemy): -state_number*(N_Agent+M_Enemy)]
-                        b_s_ = b_M[:, -state_number*(N_Agent+M_Enemy):]
+                        b_s = b_M[:, :state_dim_total]
+                        b_a = b_M[:, state_dim_total: state_dim_total + action_number*(N_Agent+M_Enemy)]
+                        b_r = b_M[:, -state_dim_total - reward_dim_total: -state_dim_total]
+                        b_s_ = b_M[:, -state_dim_total:]
                         b_s = torch.FloatTensor(b_s)
                         b_a = torch.FloatTensor(b_a)
                         b_r = torch.FloatTensor(b_r)
