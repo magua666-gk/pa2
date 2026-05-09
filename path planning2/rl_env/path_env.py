@@ -7,8 +7,6 @@ import os
 # Add project root to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import from components package
-from rl_env.components.entities import Constants
 from rl_env.components.entity_manager import EntityManager
 from rl_env.components.state_manager import StateManager
 from rl_env.components.reward_calculator import RewardCalculator
@@ -101,6 +99,8 @@ class RlGame(gym.Env):
         """
         # Reset entity manager
         self.entity_manager.reset()
+        if hasattr(self.reward_calculator, "reset"):
+            self.reward_calculator.reset()
         
         # Reset state
         self.done = False
@@ -287,7 +287,11 @@ class RlGame(gym.Env):
                     leader_distance = min(follower.distance_to(leader) for leader in self.entity_manager.leaders if leader.alive)
                 
                 # Calculate formation distance error (relative to expected formation distance)
-                expected_formation_distance = 50.0  # Expected formation distance
+                expected_formation_distance = getattr(
+                    self.reward_calculator,
+                    "ideal_formation_distance",
+                    40.0
+                )
                 formation_distance_error = abs(leader_distance - expected_formation_distance)
                 
                 follower_data = {

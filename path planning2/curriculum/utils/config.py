@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional
 
 class CurriculumConfig:
     """Curriculum learning configuration management
@@ -187,4 +187,4 @@ class CurriculumConfig:
         if not isinstance(self.get('curriculum_manager.num_initial_tasks'), int) or self.get('curriculum_manager.num_initial_tasks') <= 0:
             errors['curriculum_manager.num_initial_tasks'] = "必须是正整数"
         
-        return errors 
+        return errors

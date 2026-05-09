@@ -8,8 +8,6 @@ from matplotlib import pyplot as plt
 import os
 import pickle as pkl
 shoplistfile = 'D:/pa2/path planning2/MASAC_new1'
-shoplistfile_test = 'D:/pa2/path planning2/MASAC_d_test2'
-shoplistfile_test1 = 'D:/pa2/path planning2/MASAC_compare'
 
 # Keep legacy defaults, but allow callers to override paths for ablation runs.
 MODEL_PATH_LEADER = 'D:/pa2/path planning2/Path_SAC_actor_L1.pth'

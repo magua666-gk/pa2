@@ -1,7 +1,7 @@
 import numpy as np
 import torch
-from typing import Dict, Any, List, Optional, Tuple
-from main_SAC import Actor, policy_lr, max_action, min_action
+from typing import List
+from main_SAC import Actor, max_action, min_action
 import traceback
 
 # 创建一个动态Actor类，可以处理单个智能体的状态
@@ -303,4 +303,4 @@ class AgentPool:
             agent.to(device)
             
         print(f"智能体池已移动到设备: {device}")
-        return self 
+        return self

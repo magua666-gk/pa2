@@ -1,7 +1,7 @@
 import numpy as np
 import random
 import uuid
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple
 from .task import Task
 from .utils.config import CurriculumConfig
 
@@ -163,7 +163,10 @@ class DefaultTaskGenerator(TaskGenerator):
         env_params["goal_init_pos"] = PositionGenerator.generate_goal_position()
         
         # 生成从机位置
-        env_params["follower_init_pos"] = PositionGenerator.generate_follower_position()
+        env_params["follower_init_pos"] = PositionGenerator.generate_follower_positions_near_leader(
+            env_params["leader_init_pos"],
+            env_params["follower_count"]
+        )
         
         # 生成障碍物位置
         env_params["obstacle_init_pos"] = PositionGenerator.generate_obstacle_position()
@@ -387,10 +390,13 @@ class FixedTaskGenerator(TaskGenerator):
             # 为简化起见，直接生成位置
             positions = {
                 "leader_init_pos": [PositionGenerator.generate_leader_position() for _ in range(leader_count)],
-                "follower_init_pos": [PositionGenerator.generate_follower_position() for _ in range(follower_count)],
                 "obstacle_init_pos": [PositionGenerator.generate_obstacle_position() for _ in range(obstacle_count)],
                 "goal_init_pos": [PositionGenerator.generate_goal_position()]  # 总是只有一个目标
             }
+            positions["follower_init_pos"] = PositionGenerator.generate_follower_positions_near_leader(
+                positions["leader_init_pos"][0],
+                follower_count
+            )
             
             positions_by_difficulty[difficulty_key] = positions
         

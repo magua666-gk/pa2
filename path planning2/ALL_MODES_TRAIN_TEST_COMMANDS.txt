@@ -109,7 +109,7 @@ python main_SAC_curriculum.py --create_index
 python main_SAC_curriculum.py --analyze
 
 6.3 分析指定单个结果文件
-python main_SAC_curriculum.py --analyze --result_path "results/test_results/test_YYYYMMDD_HHMMSS_h1_e1_o1/test_results.json"
+python main_SAC_curriculum.py --analyze --result_path "results/attention_no_curriculum/tests/single_YYYYMMDD_HHMMSS_h1_e1_o1/test_results.json"
 
 6.4 强制使用自定义结果根目录（覆盖默认路径）
 python main_SAC_curriculum.py --results_dir "d:\pa2\path planning2\results\manual_results_root" --test --model_path "models/final/final_model"

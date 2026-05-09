@@ -1,10 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 
 # 从 masac_adapter 导入注意力机制和角色 ID 常量
-from masac_adapter.masac_adapter import MultiHeadAttention, GraphAttention, LEADER_TYPE_ID, FOLLOWER_TYPE_ID
+from masac_adapter.masac_adapter import MultiHeadAttention, GraphAttention
 
 class CriticObsActEncoder(nn.Module):
     """Critic 观测动作编码器
@@ -493,4 +491,4 @@ class StructuredAttentionCriticNet(nn.Module):
         for target_param, param in zip(self.target_leader_q_head.parameters(), self.leader_q_head.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
         for target_param, param in zip(self.target_follower_q_head.parameters(), self.follower_q_head.parameters()):
-            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau) 
+            target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)

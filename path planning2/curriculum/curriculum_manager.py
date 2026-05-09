@@ -2,10 +2,9 @@ import os
 import json
 import time
 import numpy as np
-import random
-from typing import Dict, List, Any, Optional, Callable, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple
 from .task import Task
-from .task_generator import TaskGenerator, DefaultTaskGenerator, FixedTaskGenerator
+from .task_generator import TaskGenerator, FixedTaskGenerator
 from .task_sequencer import TaskSequencer, LinearTaskSequencer
 from .knowledge_transfer import KnowledgeTransfer, PolicyTransfer
 from .utils.config import CurriculumConfig
@@ -529,4 +528,4 @@ class CurriculumManager:
         print(f"当前任务: {self.current_task.id} (难度: {self.current_task.difficulty:.2f})")
         
         # 返回当前任务和模型，不执行回退
-        return self.current_task, model 
+        return self.current_task, model

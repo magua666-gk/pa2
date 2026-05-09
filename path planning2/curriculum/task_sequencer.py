@@ -1,6 +1,4 @@
-import numpy as np
-import random
-from typing import List, Dict, Any, Optional, Callable, Tuple
+from typing import List, Optional
 from .task import Task
 from .utils.config import CurriculumConfig
 
@@ -288,4 +286,4 @@ class AdaptiveTaskSequencer(TaskSequencer):
         # 按综合得分排序（从高到低）
         sorted_tasks = sorted(task_scores, key=lambda x: x[1], reverse=True)
         
-        return [task for task, _ in sorted_tasks] 
+        return [task for task, _ in sorted_tasks]

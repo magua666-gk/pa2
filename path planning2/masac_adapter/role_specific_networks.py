@@ -1,15 +1,11 @@
 import torch
 import torch.nn as nn
-import numpy as np
-from typing import List, Tuple, Optional
 
 # 基本配置常量
 ROLE_EMBED_DIM = 16    # 角色嵌入维度
 EMBED_DIM = 128        # 通用嵌入维度
 
 # 导入常量
-from masac_adapter.masac_adapter import LEADER_TYPE_ID, FOLLOWER_TYPE_ID
-
 class RoleEmbedding(nn.Module):
     """角色嵌入模块
     
@@ -346,4 +342,4 @@ class CriticNetAttentionFlat(nn.Module):
             # 使用目标Q头计算Q值
             q1, q2 = self.target_q_head(combined_features)
         
-        return q1, q2 
+        return q1, q2

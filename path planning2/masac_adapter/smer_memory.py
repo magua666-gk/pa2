@@ -2,7 +2,7 @@ import collections
 import random
 import numpy as np
 import torch
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Optional
 
 try:
     from .masac_adapter import log, LOG_INFO, LOG_WARNING, LOG_ERROR, LOG_DEBUG
@@ -389,4 +389,4 @@ class SMERMemory:
 
     def __len__(self) -> int:
         """返回当前存储的经验数量"""
-        return len(self.buffer) 
+        return len(self.buffer)

@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 
 # Import action range constants from main_SAC.py
@@ -964,4 +963,4 @@ class AttentionFollowerActorNet(nn.Module):
         action = torch.clamp(action, min_action, max_action)
         
         # 返回numpy数组
-        return action.cpu().numpy().squeeze() 
+        return action.cpu().numpy().squeeze()

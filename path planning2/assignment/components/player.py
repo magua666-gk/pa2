@@ -3,18 +3,8 @@ import numpy as np
 import math
 import random
 import pygame
-# from assignment import set_up
 from assignment import constants as C
-from assignment.components import info
-from assignment import tools
-# class MySurface(pygame.Surface):
-#     def  __init__(self):
-#         super(MySurface, self).__init__()
-#
-#     def get_rect(self):
-#         super().get_rect()
-#
-#         # print('mmmm')
+
 dt=1.0
 class GameSprite(pygame.sprite.Sprite):
     def __init__(self,image_name=None,size=(20,20),speed=1):
@@ -134,18 +124,6 @@ class Enemy(GameSprite):
         # self.image = pygame.transform.scale(self.image, size=(30,30))
 
 
-# class Enemy_Group(pygame.sprite.Group):
-#     def __init__(self):
-#         super(Enemy_Group, self).__init__()
-#
-#
-#     def draw(self, surface):
-#         super().draw(surface)
-#         sprites = self.sprites()
-#         self.spritedict.update(zip(sprites,surface.blits((info.Info.create_label(self,label='{}'.format(spr.rect.center),size=10,color=C.RED),(spr.rect.x,spr.rect.y+spr.rect.height))for spr in sprites)))
-
-
-
 class Hero(GameSprite):
     def __init__(self,image=None):
         super(Hero, self).__init__(image_name=image,speed=random.randint(10,20),size=(20,20))
@@ -234,28 +212,6 @@ class Hero(GameSprite):
         # self.image=set_up.GRAPHICS['hero_blowup_n4']
         # self.image = pygame.transform.scale(self.image, size=(30,30))
 
-    # def die_image(self):
-    #     image1 = set_up.GRAPHICS['hero_blowup_n1']
-    #     image1 = pygame.transform.scale(image1, size=(30, 30))
-    #     image2 = set_up.GRAPHICS['hero_blowup_n2']
-    #     image2 = pygame.transform.scale(image2, size=(30, 30))
-    #     image3 = set_up.GRAPHICS['hero_blowup_n3']
-    #     image3 = pygame.transform.scale(image3, size=(30, 30))
-    #     image4 = set_up.GRAPHICS['hero_blowup_n4']
-    #     image4 = pygame.transform.scale(image4, size=(30, 30))
-    #     image_list=[image1,image2,image3,image4]
-    #     time_pause = [125, 125, 125, 125]  # Frame pause time
-    #     current_time = pygame.time.get_ticks()  # Get current time
-    #     if self.timer==0:
-    #         self.timer=current_time
-    #     elif current_time - self.timer > time_pause[self.index]:  # Check if enough time has passed
-    #         self.index += 1
-    #         self.index %= 4
-    #         self.timer = current_time
-    #     self.image=image_list[self.index]
-
-    # def __del__(self):
-    #     print('ji %s'%self.rect.x)
 class Obstacle(GameSprite):
     '''Obstacle'''
     def __init__(self,image=None):

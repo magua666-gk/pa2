@@ -11,9 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 import json
-import uuid
 import random
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
@@ -30,6 +28,14 @@ from masac_adapter.actor_networks import LeaderActorNet, FollowerActorNet, Atten
 from masac_adapter.critic_networks import StructuredAttentionCriticNet
 # Import curriculum learning manager
 from curriculum import CurriculumManager, FixedTaskGenerator, CurriculumConfig, LinearTaskSequencer,PolicyTransfer
+from run_paths import (
+    build_result_roots,
+    build_test_run_dir,
+    build_training_run_paths,
+    ensure_dir_exists as ensure_output_dir,
+    get_timestamp as get_output_timestamp,
+    sanitize_tag,
+)
 # ==============================================================================
 # 模块: 可视化字体配置
 # ==============================================================================
@@ -216,44 +222,6 @@ class MASACController:
         if self.share_follower_policy:
             print("Follower policy sharing enabled: all followers will reuse follower actor #0.")
             self._sync_shared_follower_policy_weights()
-            
-        # Old LeaderActorNet and FollowerActorNet code (commented out)
-        """
-        # Leader Actor network
-        self.leader_actor = LeaderActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        # Follower Actor network
-        self.follower_actor = FollowerActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        # Target Actor networks
-        self.target_leader_actor = LeaderActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        self.target_follower_actor = FollowerActorNet(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            embed_dim=embed_dim,
-            hidden_dims=actor_hidden_dims
-        )
-        
-        # Load initial target Actor parameters
-        self.target_leader_actor.load_state_dict(self.leader_actor.state_dict())
-        self.target_follower_actor.load_state_dict(self.follower_actor.state_dict())
-        """
         
         # === Create Critic network ===
         critic_hidden_dims = [256, 128]  # Critic hidden layer dimensions
@@ -483,6 +451,88 @@ class MASACController:
         except ValueError as e:
             print(f"Warning: Failed to load optimizer state for {optimizer_name}: {e}. Using fresh optimizer state.")
             return False
+
+    def _sync_entropy_alpha(self, entroy):
+        """Refresh the cached alpha value without attaching it to the grad graph."""
+        if hasattr(entroy, '_sync_alpha'):
+            return entroy._sync_alpha()
+
+        entroy.alpha = entroy.log_alpha.detach().exp()
+        return entroy.alpha
+
+    def _ensure_entropy_leaf_parameter(self, entroy, value=None):
+        """Make sure log_alpha is a leaf nn.Parameter that an optimizer can own."""
+        source = value if value is not None else getattr(entroy, 'log_alpha', None)
+        if source is None:
+            tensor = torch.zeros(1, dtype=torch.float32, device=self.device)
+        elif torch.is_tensor(source):
+            dtype = source.dtype if source.is_floating_point() else torch.float32
+            tensor = source.detach().clone().to(device=self.device, dtype=dtype)
+        else:
+            tensor = torch.tensor([float(source)], dtype=torch.float32, device=self.device)
+
+        if tensor.dim() == 0:
+            tensor = tensor.reshape(1)
+
+        entroy.log_alpha = nn.Parameter(tensor)
+        self._sync_entropy_alpha(entroy)
+        return entroy.log_alpha
+
+    def _move_entropy_to_device(self, entroy):
+        """Move entropy tensors while preserving a valid optimizer parameter."""
+        if not hasattr(entroy, 'log_alpha') or entroy.log_alpha is None:
+            self._ensure_entropy_leaf_parameter(entroy)
+            return True
+
+        if not torch.is_tensor(entroy.log_alpha):
+            self._ensure_entropy_leaf_parameter(entroy, entroy.log_alpha)
+            return True
+
+        if isinstance(entroy.log_alpha, nn.Parameter) and entroy.log_alpha.is_leaf:
+            with torch.no_grad():
+                entroy.log_alpha.data = entroy.log_alpha.detach().to(self.device).clone()
+            self._sync_entropy_alpha(entroy)
+            return False
+
+        self._ensure_entropy_leaf_parameter(entroy)
+        return True
+
+    def _current_optimizer_lr(self, optimizer, fallback_lr):
+        if optimizer is not None and getattr(optimizer, 'param_groups', None):
+            return optimizer.param_groups[0].get('lr', fallback_lr)
+        return fallback_lr
+
+    def _rebuild_alpha_optimizer(self, role):
+        """Rebuild an alpha optimizer after replacing its log_alpha Parameter."""
+        if role == 'leader':
+            lr = self._current_optimizer_lr(getattr(self, 'leader_alpha_optimizer', None), self.entropy_lr)
+            self.leader_alpha_optimizer = optim.Adam([self.entroy_leader.log_alpha], lr=lr)
+        elif role == 'follower':
+            lr = self._current_optimizer_lr(getattr(self, 'follower_alpha_optimizer', None), self.entropy_lr)
+            self.follower_alpha_optimizer = optim.Adam([self.entroy_follower.log_alpha], lr=lr)
+        else:
+            raise ValueError(f"Unknown alpha optimizer role: {role}")
+
+    def _load_entropy_state(self, entroy, entropy_state):
+        """Load entropy fields while keeping log_alpha optimizer-safe."""
+        log_alpha_value = None
+        if isinstance(entropy_state, dict):
+            log_alpha_value = entropy_state.get('log_alpha')
+            for key, value in entropy_state.items():
+                if key in ('log_alpha', 'alpha', 'optimizer'):
+                    continue
+                if isinstance(value, torch.Tensor):
+                    setattr(entroy, key, value.detach().clone().to(self.device))
+                else:
+                    setattr(entroy, key, value)
+
+        if log_alpha_value is not None:
+            self._ensure_entropy_leaf_parameter(entroy, log_alpha_value)
+        else:
+            self._move_entropy_to_device(entroy)
+
+        if hasattr(entroy, 'optimizer'):
+            entroy.optimizer = optim.Adam([entroy.log_alpha], lr=self.entropy_lr)
     
     def adapt_to_agent_count(self, n_agents):
         """Adapt to new agent count
@@ -523,12 +573,10 @@ class MASACController:
         self.target_follower_actors = self.target_follower_actors.to(device)
         
         self.critic = self.critic.to(device)
-        if hasattr(self.entroy_leader, 'log_alpha') and torch.is_tensor(self.entroy_leader.log_alpha):
-            self.entroy_leader.log_alpha = self.entroy_leader.log_alpha.to(device)
-            self.entroy_leader.alpha = self.entroy_leader.alpha.to(device)
-        if hasattr(self.entroy_follower, 'log_alpha') and torch.is_tensor(self.entroy_follower.log_alpha):
-            self.entroy_follower.log_alpha = self.entroy_follower.log_alpha.to(device)
-            self.entroy_follower.alpha = self.entroy_follower.alpha.to(device)
+        if self._move_entropy_to_device(self.entroy_leader):
+            self._rebuild_alpha_optimizer('leader')
+        if self._move_entropy_to_device(self.entroy_follower):
+            self._rebuild_alpha_optimizer('follower')
         
         # Move optimizer state
         optimizers_to_move = [
@@ -1318,7 +1366,7 @@ class MASACController:
         self.leader_alpha_optimizer.step()
         
         # Update alpha value
-        self.entroy_leader.alpha = self.entroy_leader.log_alpha.exp()
+        self._sync_entropy_alpha(self.entroy_leader)
         
         # Follower alpha
         alpha_loss_followers = -(self.entroy_follower.log_alpha * (
@@ -1336,11 +1384,13 @@ class MASACController:
         self.follower_alpha_optimizer.step()
         
         # Update alpha value
-        self.entroy_follower.alpha = self.entroy_follower.log_alpha.exp()
+        self._sync_entropy_alpha(self.entroy_follower)
 
         with torch.no_grad():
-            self.entroy_leader.log_alpha.data.clamp_(-20.0, 2.0)
-            self.entroy_follower.log_alpha.data.clamp_(-20.0, 2.0)
+            self.entroy_leader.log_alpha.clamp_(-20.0, 2.0)
+            self.entroy_follower.log_alpha.clamp_(-20.0, 2.0)
+        self._sync_entropy_alpha(self.entroy_leader)
+        self._sync_entropy_alpha(self.entroy_follower)
         
         # ===== Soft update target networks =====
         # Update Critic target network
@@ -1520,20 +1570,12 @@ class MASACController:
             
             # Load entropy parameters
             if 'entroy_leader' in checkpoint:
-                # Handle tensors
-                for key, value in checkpoint['entroy_leader'].items():
-                    if isinstance(value, torch.Tensor):
-                        setattr(self.entroy_leader, key, value.to(self.device))
-                    else:
-                        setattr(self.entroy_leader, key, value)
+                self._load_entropy_state(self.entroy_leader, checkpoint['entroy_leader'])
+                self._rebuild_alpha_optimizer('leader')
                         
             if 'entroy_follower' in checkpoint:
-                # Handle tensors
-                for key, value in checkpoint['entroy_follower'].items():
-                    if isinstance(value, torch.Tensor):
-                        setattr(self.entroy_follower, key, value.to(self.device))
-                    else:
-                        setattr(self.entroy_follower, key, value)
+                self._load_entropy_state(self.entroy_follower, checkpoint['entroy_follower'])
+                self._rebuild_alpha_optimizer('follower')
             
             # Load optimizer parameters (if exists)
             if 'leader_actor_optimizer' in checkpoint:
@@ -1743,39 +1785,19 @@ class MASACController:
                 # 更新Leader Entropy
                 if 'entropy_0' in entropy_params:
                     leader_entropy = entropy_params['entropy_0']
-                    for key, value in leader_entropy.items():
-                        if key == 'log_alpha' and isinstance(value, torch.Tensor):
-                            # 确保log_alpha保留梯度信息
-                            if not hasattr(self.entroy_leader, 'log_alpha') or self.entroy_leader.log_alpha is None:
-                                self.entroy_leader.log_alpha = value.clone().to(self.device).requires_grad_(True)
-                            else:
-                                self.entroy_leader.log_alpha.data.copy_(value.to(self.device))
-                        elif isinstance(value, torch.Tensor):
-                            setattr(self.entroy_leader, key, value.to(self.device))
-                        else:
-                            setattr(self.entroy_leader, key, value)
+                    self._load_entropy_state(self.entroy_leader, leader_entropy)
                     
                     # 确保重新设置优化器
-                    self.leader_alpha_optimizer = torch.optim.Adam([self.entroy_leader.log_alpha], lr=self.entropy_lr)
+                    self._rebuild_alpha_optimizer('leader')
                     updated_components.append("Leader Entropy")
                 
                 # 更新Follower Entropy
                 if 'entropy_1' in entropy_params:
                     follower_entropy = entropy_params['entropy_1']
-                    for key, value in follower_entropy.items():
-                        if key == 'log_alpha' and isinstance(value, torch.Tensor):
-                            # 确保log_alpha保留梯度信息
-                            if not hasattr(self.entroy_follower, 'log_alpha') or self.entroy_follower.log_alpha is None:
-                                self.entroy_follower.log_alpha = value.clone().to(self.device).requires_grad_(True)
-                            else:
-                                self.entroy_follower.log_alpha.data.copy_(value.to(self.device))
-                        elif isinstance(value, torch.Tensor):
-                            setattr(self.entroy_follower, key, value.to(self.device))
-                        else:
-                            setattr(self.entroy_follower, key, value)
+                    self._load_entropy_state(self.entroy_follower, follower_entropy)
                     
                     # 确保重新设置优化器
-                    self.follower_alpha_optimizer = torch.optim.Adam([self.entroy_follower.log_alpha], lr=self.entropy_lr)
+                    self._rebuild_alpha_optimizer('follower')
                     updated_components.append("Follower Entropy (所有从机共享)")
             
             # 更新 Critic 参数
@@ -1801,8 +1823,9 @@ def ensure_dir_exists(dir_path):
     Args:
         dir_path: 目录路径
     """
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path, exist_ok=True)
+    existed = os.path.exists(dir_path)
+    ensure_output_dir(dir_path)
+    if not existed:
         print(f"创建目录: {dir_path}")
     return dir_path
 
@@ -1812,7 +1835,7 @@ def get_timestamp():
     Returns:
         格式化的时间戳字符串: YYYYMMDD_HHMMSS
     """
-    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return get_output_timestamp()
 
 
 # ==============================================================================
@@ -1821,11 +1844,7 @@ def get_timestamp():
 
 def _sanitize_tag(tag: str, default_tag: str = "ablation_no_curriculum") -> str:
     """Sanitize user-provided tags for safe filesystem paths."""
-    if not tag:
-        return default_tag
-
-    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in tag.strip())
-    return safe or default_tag
+    return sanitize_tag(tag, default_tag=default_tag)
 
 
 def _default_no_curriculum_tag(use_attention: bool, use_gat: bool) -> str:
@@ -1846,25 +1865,20 @@ def _default_curriculum_tag(use_attention: bool, use_gat: bool) -> str:
     return "curriculum_attention"
 
 
-def prepare_no_curriculum_output_paths(output_root: str, ablation_tag: str) -> Dict[str, str]:
+def prepare_no_curriculum_output_paths(
+    output_root: str,
+    ablation_tag: str,
+    seed: int = None,
+    run_id: int = None,
+) -> Dict[str, str]:
     """Create isolated save paths for no-curriculum ablation runs."""
-    run_stamp = get_timestamp()
     safe_tag = _sanitize_tag(ablation_tag)
-
-    model_dir = os.path.join(output_root, "models", safe_tag, run_stamp)
-    result_dir = os.path.join(output_root, "results", safe_tag)
-
-    ensure_dir_exists(model_dir)
-    ensure_dir_exists(result_dir)
-
-    return {
-        "run_stamp": run_stamp,
-        "model_dir": model_dir,
-        "result_dir": result_dir,
-        "leader_model_path": os.path.join(model_dir, "Path_SAC_actor_L1.pth"),
-        "follower_model_path": os.path.join(model_dir, "Path_SAC_actor_F1.pth"),
-        "training_result_path": os.path.join(result_dir, f"MASAC_{safe_tag}_{run_stamp}.pkl")
-    }
+    return build_training_run_paths(
+        output_root=output_root,
+        experiment_tag=safe_tag,
+        seed=seed,
+        run_id=run_id,
+    )
 
 
 # ==============================================================================
@@ -1874,17 +1888,12 @@ def prepare_no_curriculum_output_paths(output_root: str, ablation_tag: str) -> D
 def prepare_no_curriculum_result_roots(output_root: str, ablation_tag: str) -> Dict[str, str]:
     """Create isolated result roots for no-curriculum experiments/tests."""
     safe_tag = _sanitize_tag(ablation_tag)
-    result_dir = os.path.join(output_root, "results", safe_tag)
-    test_results_base = os.path.join(result_dir, "test_results")
-
-    ensure_dir_exists(result_dir)
-    ensure_dir_exists(test_results_base)
-
-    return {
-        "result_dir": result_dir,
-        "test_results_base": test_results_base,
-        "training_results_file_prefix": os.path.join(result_dir, f"MASAC_{safe_tag}")
-    }
+    result_roots = build_result_roots(output_root=output_root, experiment_tag=safe_tag)
+    result_roots["training_results_file_prefix"] = os.path.join(
+        result_roots["training_base"],
+        f"MASAC_{safe_tag}"
+    )
+    return result_roots
 
 
 def infer_ablation_tag_from_model_path(model_path: str) -> str:
@@ -1911,18 +1920,12 @@ def infer_ablation_tag_from_model_path(model_path: str) -> str:
 def prepare_curriculum_result_roots(output_root: str, use_attention: bool, use_gat: bool = False) -> Dict[str, str]:
     """Create isolated result roots for curriculum experiments."""
     safe_tag = _default_curriculum_tag(use_attention=use_attention, use_gat=use_gat)
-    result_dir = os.path.join(output_root, "results", safe_tag)
-    # GAT curriculum 测试结果直接放到结果根目录下，避免再额外创建一层 test_results 目录。
-    test_results_base = result_dir if (use_attention and use_gat) else os.path.join(result_dir, "test_results")
-
-    ensure_dir_exists(result_dir)
-    ensure_dir_exists(test_results_base)
-
-    return {
-        "result_dir": result_dir,
-        "test_results_base": test_results_base,
-        "training_results_file_prefix": os.path.join(result_dir, f"MASAC_{safe_tag}")
-    }
+    result_roots = build_result_roots(output_root=output_root, experiment_tag=safe_tag)
+    result_roots["training_results_file_prefix"] = os.path.join(
+        result_roots["training_base"],
+        f"MASAC_{safe_tag}"
+    )
+    return result_roots
 
 def convert_to_json_compatible(obj):
     """将对象转换为JSON兼容格式
@@ -1965,33 +1968,40 @@ def create_test_results_index():
     # 确保测试结果目录存在
     ensure_dir_exists(TEST_RESULTS_BASE)
     
-    # 查找所有测试结果目录
+    # Recursively find single-test and multi-difficulty result directories.
     test_dirs = []
-    for item in os.listdir(TEST_RESULTS_BASE):
-        item_path = os.path.join(TEST_RESULTS_BASE, item)
-        if os.path.isdir(item_path):
-            # 获取目录信息
-            try:
-                # 检查是否有JSON结果文件
-                json_files = [f for f in os.listdir(item_path) if f.endswith('.json')]
-                info_file = os.path.join(item_path, "test_info.json")
-                
-                if os.path.exists(info_file):
-                    with open(info_file, 'r', encoding='utf-8') as f:
-                        info = json.load(f)
-                    
-                    # 收集测试信息
-                    test_dirs.append({
-                        'dir_name': item,
-                        'timestamp': info.get('timestamp', ''),
-                        'date': info.get('date', ''),
-                        'config': info.get('config', {}),
-                        'images': [f for f in os.listdir(item_path) if f.endswith('.png')],
-                        'success_rate': info.get('success_rate', 'N/A'),
-                        'path': item_path
-                    })
-            except Exception as e:
-                print(f"处理目录 {item_path} 时出错: {e}")
+    for root, _, files in os.walk(TEST_RESULTS_BASE):
+        has_single_result = "test_results.json" in files
+        has_multi_result = "all_results.json" in files
+        if not (has_single_result or has_multi_result):
+            continue
+
+        try:
+            info_file = os.path.join(root, "test_info.json")
+            config_file = os.path.join(root, "test_config.json")
+            info = {}
+
+            if os.path.exists(info_file):
+                with open(info_file, 'r', encoding='utf-8') as f:
+                    info = json.load(f)
+            elif os.path.exists(config_file):
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    info = json.load(f)
+
+            result_file = "test_results.json" if has_single_result else "all_results.json"
+            test_dirs.append({
+                'dir_name': os.path.basename(root),
+                'timestamp': info.get('timestamp', os.path.basename(root)),
+                'date': info.get('date', ''),
+                'config': info.get('config', info.get('difficulty_levels', {})),
+                'images': [f for f in files if f.endswith('.png')],
+                'success_rate': info.get('success_rate', 'N/A'),
+                'path': root,
+                'info_file': "test_info.json" if os.path.exists(info_file) else "test_config.json",
+                'result_file': result_file,
+            })
+        except Exception as e:
+            print(f"处理目录 {root} 时出错: {e}")
     
     # 按时间戳排序
     test_dirs.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -2031,12 +2041,14 @@ def create_test_results_index():
     for test in test_dirs:
         config_str = ""
         config = test.get('config', {})
-        if config:
+        if isinstance(config, dict) and config:
             config_str = f"友方:{config.get('hero_count', 'N/A')}, " \
                         f"敌方:{config.get('enemy_count', 'N/A')}, " \
                         f"障碍:{config.get('obstacle_count', 'N/A')}"
             if config.get('uav_speed', 'N/A') != 'N/A':
                 config_str += f", 速度:{config['uav_speed']}"
+        elif config:
+            config_str = str(config)
         
         # 图片链接
         img_links = ""
@@ -2045,8 +2057,8 @@ def create_test_results_index():
             img_links += f'<a href="file:///{img_path}" class="img-link" target="_blank">{img}</a>'
         
         # 详细信息链接
-        info_link = os.path.join(test['path'], "test_info.json").replace('\\', '/')
-        result_link = os.path.join(test['path'], "test_results.json").replace('\\', '/')
+        info_link = os.path.join(test['path'], test.get("info_file", "test_info.json")).replace('\\', '/')
+        result_link = os.path.join(test['path'], test.get("result_file", "test_results.json")).replace('\\', '/')
         
         html_content += f"""
             <tr>
@@ -2144,7 +2156,6 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
     if run_id is not None:
         print(f"训练运行ID: {run_id}")
     
-    # 确保结果目录存在
     global RESULTS_DIR, TEST_RESULTS_BASE, TRAINING_RESULTS_FILE
     ensure_dir_exists(RESULTS_DIR)
     ensure_dir_exists(TEST_RESULTS_BASE)
@@ -2161,27 +2172,24 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
     all_ep_r1 = [[] for _ in range(TRAIN_NUM)]
     k = 0  # 使用索引0，因为TRAIN_NUM=1
     
-    # 为每次课程训练创建独立模型目录，避免覆盖历史实验。
     if use_attention:
-        arch_tag = "gat_attention" if use_gat else "attention"
         result_prefix = "MASAC_curriculum_gat_attention" if use_gat else "MASAC_curriculum"
     else:
-        arch_tag = "no_attention"
         result_prefix = "MASAC_curriculum_no_attention"
-    run_suffix = f"_run{run_id}" if run_id is not None else ""
     output_root = getattr(args, "ablation_output_root", None) or os.path.dirname(os.path.abspath(__file__))
-    if use_attention:
-        models_root_dir = os.path.join(output_root, "models")
-    else:
-        models_root_dir = os.path.join(output_root, "models", "ablation_curriculum_no_attention")
-    models_base_dir = os.path.join(
-        models_root_dir,
-        f"curriculum_{arch_tag}_{get_timestamp()}{run_suffix}_seed{seed}"
+    experiment_tag = _default_curriculum_tag(use_attention=use_attention, use_gat=use_gat)
+    training_paths = build_training_run_paths(
+        output_root=output_root,
+        experiment_tag=experiment_tag,
+        seed=seed,
+        run_id=run_id,
     )
+    models_base_dir = training_paths["model_dir"]
+    training_run_dir = training_paths["training_dir"]
+    plots_dir = training_paths["plots_dir"]
 
-    # 创建模型基础目录
-    os.makedirs(models_base_dir, exist_ok=True)
     log(f"课程学习模型目录: {models_base_dir}", LOG_INFO)
+    log(f"课程学习结果目录: {training_run_dir}", LOG_INFO)
     
     # 设置日志级别
     set_log_level(LOG_DEBUG)  # 从INFO改为DEBUG级别，显示更详细的日志信息
@@ -2538,7 +2546,12 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
                 step_count += 1
                 
                 # 计算编队时间
-                if team_counter > 0:
+                current_in_formation = (
+                    env.entity_manager.is_currently_in_formation()
+                    if hasattr(env.entity_manager, "is_currently_in_formation")
+                    else team_counter > 0
+                )
+                if current_in_formation:
                     team_formation_time += 1
                 
                 # 渲染环境
@@ -2639,7 +2652,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
             metrics = {
                 'reward': total_reward,
                 'success_rate': float(win),
-                'team_coordination': team_counter  # 编队保持率
+                'team_coordination': env.entity_manager.get_formation_rate()  # 编队保持率
             }
             # 检查返回值，如果为True则说明达到最大总回合数，需终止训练
             if curriculum_manager.update_task_performance(metrics):
@@ -2750,10 +2763,10 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
             run_suffix = f"_run{run_id}" if run_id is not None else ""
             # 确保最后一个任务使用正确的步骤编号（curriculum_step + 1，而不是 curriculum_step）
             result_filename = f"{result_prefix}_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.pkl"
-            result_path = os.path.join(RESULTS_DIR, result_filename)
+            result_path = os.path.join(training_run_dir, result_filename)
             
             # 确保结果目录存在
-            ensure_dir_exists(RESULTS_DIR)
+            ensure_dir_exists(training_run_dir)
             log(f"保存最终任务训练结果到 {result_path}", LOG_INFO)
             
             try:
@@ -2803,7 +2816,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
             
             # 保存图表 - 使用与训练结果数据文件匹配的文件名（不含扩展名）
             plot_filename = f"{result_prefix}_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.png"
-            plot_path = os.path.join(RESULTS_DIR, plot_filename)
+            plot_path = os.path.join(plots_dir, plot_filename)
             
             try:
                 plt.savefig(plot_path)
@@ -2890,10 +2903,10 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         seed_suffix = f"_seed{seed}" if seed != 42 else ""
         run_suffix = f"_run{run_id}" if run_id is not None else ""
         result_filename = f"{result_prefix}_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.pkl"
-        result_path = os.path.join(RESULTS_DIR, result_filename)
+        result_path = os.path.join(training_run_dir, result_filename)
         
         # 确保结果目录存在
-        ensure_dir_exists(RESULTS_DIR)
+        ensure_dir_exists(training_run_dir)
         log(f"保存训练结果到 {result_path}", LOG_INFO)
         
         try:
@@ -2943,7 +2956,7 @@ def run_with_curriculum(args, initial_n_agent, initial_m_enemy, seed=42, run_id=
         
         # 保存图表 - 使用与训练结果数据文件匹配的文件名（不含扩展名）
         plot_filename = f"{result_prefix}_{timestamp}{run_suffix}{seed_suffix}_step{curriculum_step+1}.png"
-        plot_path = os.path.join(RESULTS_DIR, plot_filename)
+        plot_path = os.path.join(plots_dir, plot_filename)
         
         try:
             plt.savefig(plot_path)
@@ -3031,13 +3044,15 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
     ablation_output_root = args.ablation_output_root or os.path.dirname(os.path.abspath(__file__))
     no_curriculum_paths = prepare_no_curriculum_output_paths(
         output_root=ablation_output_root,
-        ablation_tag=effective_ablation_tag
+        ablation_tag=effective_ablation_tag,
+        seed=seed,
+        run_id=run_id,
     )
 
     model_dir = no_curriculum_paths["model_dir"]
     result_path = no_curriculum_paths["training_result_path"]
-    plot_path = os.path.splitext(result_path)[0] + ".png"
-    final_model_path = os.path.join(model_dir, "final_model")
+    plot_path = no_curriculum_paths["training_plot_path"]
+    final_model_path = no_curriculum_paths["final_model_path"]
 
     print("无课程学习输出路径:")
     print(f"- 实验标签: {effective_ablation_tag}")
@@ -3063,7 +3078,7 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
     stop_reason = None
     stop_episode = None
     stop_timestep = None
-    diagnostic_path = os.path.splitext(result_path)[0] + "_diagnostics.json"
+    diagnostic_path = no_curriculum_paths["diagnostic_path"]
     nonfinite_stop_model_path = os.path.join(model_dir, "nonfinite_stop_model")
 
     def _extract_reward_components(reward_data):
@@ -3156,7 +3171,12 @@ def run_attention_no_curriculum(args, initial_n_agent, initial_m_enemy, seed=42,
                 reward_total_leader += leader_r
                 reward_total_follower1 += follower1_r
 
-                if team_counter > 0:
+                current_in_formation = (
+                    env.entity_manager.is_currently_in_formation()
+                    if hasattr(env.entity_manager, "is_currently_in_formation")
+                    else team_counter > 0
+                )
+                if current_in_formation:
                     team_formation_time += 1
 
                 observation = observation_
@@ -3517,9 +3537,18 @@ def run_multi_seed_curriculum(args, initial_n_agent, initial_m_enemy):
     # 保存汇总结果
     timestamp = get_timestamp()
     use_attention = not bool(getattr(args, "disable_attention", False))
-    summary_prefix = "MASAC_curriculum_multi_run_summary" if use_attention else "MASAC_curriculum_no_attention_multi_run_summary"
-    summary_filename = f"{summary_prefix}_{timestamp}.pkl"
-    summary_path = os.path.join(RESULTS_DIR, summary_filename)
+    use_gat = bool(getattr(args, "gat", False))
+    summary_prefix = (
+        "MASAC_curriculum_gat_attention_multi_run_summary"
+        if use_gat
+        else "MASAC_curriculum_multi_run_summary"
+        if use_attention
+        else "MASAC_curriculum_no_attention_multi_run_summary"
+    )
+    summary_dir = os.path.join(RESULTS_DIR, "training", f"multi_run_{timestamp}")
+    ensure_dir_exists(summary_dir)
+    summary_filename = f"{summary_prefix}.pkl"
+    summary_path = os.path.join(summary_dir, summary_filename)
     
     summary_results = {
         'num_runs': args.num_runs,
@@ -3640,7 +3669,17 @@ def analyze_curriculum_learning(manager: CurriculumManager):
 # 模块: 单配置蒙特卡洛测试
 # ==============================================================================
 
-def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, collect_formation_data=True, share_follower_policy=False, use_attention=True, use_gat=False):
+def run_monte_carlo_test(
+    model_path,
+    test_episodes=None,
+    test_options=None,
+    collect_formation_data=True,
+    share_follower_policy=False,
+    use_attention=True,
+    use_gat=False,
+    output_base_dir=None,
+    test_run_label="single",
+):
     """运行蒙特卡洛测试以评估模型性能
     
     Args:
@@ -3728,6 +3767,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     rewards = []
     steps = []
     formation_rates = []
+    partial_formation_rates = []
     distances = []  # 智能体最终与目标的距离
     trajectory_lengths = []  # 飞行轨迹长度列表
     energy_consumptions = []  # 能量消耗列表
@@ -3758,6 +3798,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         done = False
         step_count = 0
         team_formation_time = 0
+        partial_formation_time = 0.0
         last_distance = None
         
         # 初始化当前回合的数据收集
@@ -3803,21 +3844,15 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             # 记录最后一步的距离
             last_distance = dis
             
-            # 更新状态和统计
-           # 更新状态和统计
             observation = observation_
             
-# 累加当前时间步的总奖励
             current_step_reward = 0.0
             if isinstance(reward, dict):
-                leader_r = reward.get("leader", 0.0)      # 安全获取leader奖励，默认为0.0
-                followers_r = reward.get("followers", []) # 安全获取followers奖励列表，默认为空列表
-
-    # 累加 Leader 奖励 (确保是数字)
+                leader_r = reward.get("leader", 0.0)
+                followers_r = reward.get("followers", [])
                 if isinstance(leader_r, (int, float, np.number)):
                     current_step_reward += float(leader_r)
 
-    # 累加 Followers 奖励 (确保列表中的元素是数字)
                 if isinstance(followers_r, list):
                     for r in followers_r:
                         if isinstance(r, (int, float, np.number)):
@@ -3825,8 +3860,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             elif isinstance(reward, (np.ndarray, list)): # 兼容旧格式
                 try:
                     current_step_reward = np.mean(reward)
-                except:
-        # 忽略无法处理的旧格式
+                except (TypeError, ValueError):
                     pass
             elif isinstance(reward, (int, float, np.number)): # 单个数值奖励
                 current_step_reward = float(reward)
@@ -3835,8 +3869,15 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             step_count += 1
             
             # 计算编队时间
-            if team_counter > 0:
+            current_in_formation = (
+                env.entity_manager.is_currently_in_formation()
+                if hasattr(env.entity_manager, "is_currently_in_formation")
+                else team_counter > 0
+            )
+            if current_in_formation:
                 team_formation_time += 1
+            if hasattr(env.entity_manager, "get_current_formation_fraction"):
+                partial_formation_time += env.entity_manager.get_current_formation_fraction()
             
             # 渲染环境
             if RENDER:
@@ -3859,6 +3900,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
                 episode_formation_data['episode_summary'] = {
                     'total_steps': len(timesteps_data),
                     'formation_rate': team_formation_time / step_count if step_count > 0 else 0,
+                    'partial_formation_rate': partial_formation_time / step_count if step_count > 0 else 0,
                     'avg_formation_error': float(avg_formation_error),
                     'total_reward': float(total_reward),
                     'success': bool(win)
@@ -3873,7 +3915,9 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         
         # 计算这一回合的编队保持率
         formation_rate = team_formation_time / step_count if step_count > 0 else 0
+        partial_formation_rate = partial_formation_time / step_count if step_count > 0 else 0
         formation_rates.append(formation_rate)
+        partial_formation_rates.append(partial_formation_rate)
         
         # 记录最终距离
         if last_distance is not None:
@@ -3897,7 +3941,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         # 输出回合信息
         status = "成功" if win else "失败"
         print(f"测试回合 {episode+1}/{test_episodes}, 状态: {status}, 奖励: {total_reward:.1f}, "
-              f"步数: {step_count}, 编队率: {formation_rate:.2f}")
+              f"步数: {step_count}, 编队率: {formation_rate:.2f}, 部分编队率: {partial_formation_rate:.2f}")
     
     # 计算编队数据的汇总统计
     if collect_formation_data and formation_data:
@@ -3926,6 +3970,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         
         formation_data['summary_stats'] = {
             'mean_formation_quality': float(np.mean(formation_rates)) if formation_rates else 0.0,
+            'mean_partial_formation_quality': float(np.mean(partial_formation_rates)) if partial_formation_rates else 0.0,
             'avg_heading_angles': {
                 'leaders': float(np.mean(all_heading_angles['leaders'])) if all_heading_angles['leaders'] else 0.0,
                 'followers': float(np.mean(all_heading_angles['followers'])) if all_heading_angles['followers'] else 0.0
@@ -3945,6 +3990,8 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     std_steps = np.std(steps)
     avg_formation_rate = np.mean(formation_rates)
     std_formation_rate = np.std(formation_rates)
+    avg_partial_formation_rate = np.mean(partial_formation_rates)
+    std_partial_formation_rate = np.std(partial_formation_rates)
     
     # 计算最终距离的平均值和标准差
     avg_distance = np.mean(distances) if distances else 0
@@ -3964,6 +4011,7 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     print(f"测试回合数: {test_episodes}")
     print(f"1. 任务完成率(MCR): {success_rate:.2f}")
     print(f"2. 编队保持率(FKR): {avg_formation_rate:.2f}±{std_formation_rate:.2f}")
+    print(f"   部分编队率(PFKR): {avg_partial_formation_rate:.2f}±{std_partial_formation_rate:.2f}")
     print(f"3. 成功率加权探索时间(SET): {set_score:.2f} (SR: {success_rate:.2f} × 平均时间: {avg_steps:.2f})")
     print(f"4. 飞行轨迹(J_S): {avg_trajectory_length:.2f}±{std_trajectory_length:.2f}")
     print(f"5. 能量消耗(J_C): {avg_energy_consumption:.2f}±{std_energy_consumption:.2f}")
@@ -3993,6 +4041,11 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
             "mean": float(avg_formation_rate),
             "std": float(std_formation_rate),
             "values": [float(f) for f in formation_rates]
+        },
+        "partial_formation_rates": {
+            "mean": float(avg_partial_formation_rate),
+            "std": float(std_partial_formation_rate),
+            "values": [float(f) for f in partial_formation_rates]
         },
         "distances": {
             "mean": float(avg_distance),
@@ -4025,14 +4078,19 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
     
     # 创建唯一的测试ID和保存目录
     timestamp = get_timestamp()
-    config_str = f"_h{hero_count}_e{enemy_count}_o{obstacle_count}"
+    config_parts = [f"h{hero_count}", f"e{enemy_count}", f"o{obstacle_count}"]
     if uav_speed:
-        config_str += f"_s{int(uav_speed)}"
+        config_parts.append(f"s{int(uav_speed)}")
     
     # 创建保存目录
-    test_dir_name = f"test_{timestamp}{config_str}"
-    test_dir = os.path.join(TEST_RESULTS_BASE, test_dir_name)
-    ensure_dir_exists(test_dir)
+    test_base_dir = output_base_dir or TEST_RESULTS_BASE
+    test_paths = build_test_run_dir(
+        tests_base=test_base_dir,
+        run_kind=test_run_label,
+        config_parts=config_parts,
+        timestamp=timestamp,
+    )
+    test_dir = test_paths["test_dir"]
     
     # 保存测试结果 (pickle格式)
     pickle_path = os.path.join(test_dir, "test_results.pkl")
@@ -4058,7 +4116,8 @@ def run_monte_carlo_test(model_path, test_episodes=None, test_options=None, coll
         "success_rate": success_rate,
         "avg_reward": float(avg_reward),
         "avg_steps": float(avg_steps),
-        "formation_rate": float(avg_formation_rate)
+        "formation_rate": float(avg_formation_rate),
+        "partial_formation_rate": float(avg_partial_formation_rate)
     }
     
     info_path = os.path.join(test_dir, "test_info.json")
@@ -4418,8 +4477,15 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
     # 创建多难度测试专用目录
     timestamp = get_timestamp()
     model_name = os.path.basename(actor_path)
-    multi_test_dir = os.path.join(TEST_RESULTS_BASE, f"multi_diff_test_{timestamp}_{model_name}")
-    ensure_dir_exists(multi_test_dir)
+    multi_paths = build_test_run_dir(
+        tests_base=TEST_RESULTS_BASE,
+        run_kind="multi_difficulty",
+        config_parts=[model_name],
+        timestamp=timestamp,
+    )
+    multi_test_dir = multi_paths["test_dir"]
+    levels_dir = os.path.join(multi_test_dir, "levels")
+    ensure_dir_exists(levels_dir)
     
     # 保存测试配置信息
     test_config = {
@@ -4455,7 +4521,9 @@ def monte_carlo_test(actor_path, critic_path=None, test_nums=100, base_difficult
             test_options=difficulty_config,
             share_follower_policy=share_follower_policy,
             use_attention=use_attention,
-            use_gat=use_gat
+            use_gat=use_gat,
+            output_base_dir=levels_dir,
+            test_run_label=f"level{difficulty_idx+1}"
         )
         
         # 存储结果
@@ -4626,7 +4694,7 @@ def main():
                        help='测试结果文件路径，默认自动搜索')
     # 添加结果保存目录选项
     parser.add_argument('--results_dir', type=str, default=None,
-                       help='测试结果保存目录，默认为"D:/pa/path planning2/results"')
+                       help='测试/训练结果保存根目录；内部按 training/ 与 tests/ 分开')
     parser.add_argument('--create_index', action='store_true',
                        help='生成测试结果索引HTML文件')
     # 添加日志级别控制
@@ -4692,10 +4760,11 @@ def main():
     # 如果指定了结果目录，更新全局变量
     if args.results_dir:
         RESULTS_DIR = args.results_dir
-        TEST_RESULTS_BASE = os.path.join(RESULTS_DIR, "test_results")
-        TRAINING_RESULTS_FILE = os.path.join(RESULTS_DIR, "MASAC_curriculum")
+        TEST_RESULTS_BASE = os.path.join(RESULTS_DIR, "tests")
+        TRAINING_RESULTS_FILE = os.path.join(RESULTS_DIR, "training")
         print(f"结果将保存在: {RESULTS_DIR}")
         ensure_dir_exists(RESULTS_DIR)
+        ensure_dir_exists(TRAINING_RESULTS_FILE)
         ensure_dir_exists(TEST_RESULTS_BASE)
 
     # 有课程学习默认写入独立目录，避免注意力/GAT/无注意力结果混放。
@@ -4911,9 +4980,13 @@ def main():
 
                 # 为无课程学习消融实验创建独立输出路径，避免覆盖历史模型和结果。
                 ablation_output_root = args.ablation_output_root or os.path.dirname(os.path.abspath(__file__))
+                standard_sac_tag = _sanitize_tag(args.ablation_tag)
+                if standard_sac_tag == "ablation_no_curriculum":
+                    standard_sac_tag = "standard_sac_no_curriculum"
                 no_curriculum_paths = prepare_no_curriculum_output_paths(
                     output_root=ablation_output_root,
-                    ablation_tag=args.ablation_tag
+                    ablation_tag=standard_sac_tag,
+                    seed=startup_seed,
                 )
 
                 main_SAC.configure_output_paths(
@@ -4961,8 +5034,8 @@ if __name__ == "__main__":
     MemoryCapacity = 50000
     BATCH = 256
     RESULTS_DIR = "D:/pa2/path planning2/results"
-    TEST_RESULTS_BASE = os.path.join(RESULTS_DIR, "test_results")
-    TRAINING_RESULTS_FILE = os.path.join(RESULTS_DIR, "MASAC_curriculum.pkl")
+    TEST_RESULTS_BASE = os.path.join(RESULTS_DIR, "tests")
+    TRAINING_RESULTS_FILE = os.path.join(RESULTS_DIR, "training")
 
     main()
     

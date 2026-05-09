@@ -1,10 +1,4 @@
-import numpy as np
-import torch
-import os
 import copy
-from typing import Dict, Any, Optional, Union, List, Tuple
-from .task import Task
-from .utils.config import CurriculumConfig
 
 class KnowledgeTransfer:
     """Knowledge transfer base class
@@ -606,4 +600,4 @@ def create_knowledge_transfer(transfer_type, config=None):
         return NoTransfer(config)
     else:
         print(f"警告: 未知的知识迁移类型 '{transfer_type}'，使用基本知识迁移")
-        return KnowledgeTransfer(config) 
+        return KnowledgeTransfer(config)

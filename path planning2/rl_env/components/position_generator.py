@@ -1,5 +1,5 @@
 import random
-import numpy as np
+import math
 from rl_env.components.entities import Constants
 
 class PositionGenerator:
@@ -47,6 +47,36 @@ class PositionGenerator:
         y = random.randint(area_y + 2*area_height//3, area_y + area_height - margin)
         
         return x, y
+
+    @staticmethod
+    def _clamp_position(x, y, margin=20):
+        area_x, area_y, area_width, area_height, _ = PositionGenerator.get_map_bounds()
+        min_x = area_x + margin
+        max_x = area_x + area_width - margin
+        min_y = area_y + margin
+        max_y = area_y + area_height - margin
+
+        return (
+            int(max(min_x, min(max_x, x))),
+            int(max(min_y, min(max_y, y)))
+        )
+
+    @staticmethod
+    def generate_follower_positions_near_leader(leader_position, follower_count, radius=40.0):
+        """Generate follower positions around a leader at the nominal formation distance."""
+        if follower_count <= 0:
+            return []
+
+        leader_x, leader_y = leader_position
+        positions = []
+
+        for i in range(follower_count):
+            angle = 2.0 * math.pi * i / follower_count
+            x = leader_x + radius * math.cos(angle)
+            y = leader_y + radius * math.sin(angle)
+            positions.append(PositionGenerator._clamp_position(x, y))
+
+        return positions
     
     @staticmethod
     def generate_obstacle_position():
@@ -89,11 +119,20 @@ class PositionGenerator:
         Returns:
             Dictionary containing all entity positions
         """
+        leader_positions = [PositionGenerator.generate_leader_position() for _ in range(leader_count)]
+        if leader_positions:
+            follower_positions = PositionGenerator.generate_follower_positions_near_leader(
+                leader_positions[0],
+                follower_count
+            )
+        else:
+            follower_positions = [PositionGenerator.generate_follower_position() for _ in range(follower_count)]
+
         positions = {
-            'leaders': [PositionGenerator.generate_leader_position() for _ in range(leader_count)],
-            'followers': [PositionGenerator.generate_follower_position() for _ in range(follower_count)],
+            'leaders': leader_positions,
+            'followers': follower_positions,
             'obstacles': [PositionGenerator.generate_obstacle_position() for _ in range(obstacle_count)],
             'goals': [PositionGenerator.generate_goal_position() for _ in range(goal_count)]
         }
         
-        return positions 
+        return positions

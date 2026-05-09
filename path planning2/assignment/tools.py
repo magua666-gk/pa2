@@ -1,5 +1,4 @@
 import pygame
-from assignment import constants as C
 import os
 
 def load_graphics(path,accept=('.jpg','.png','.bmp','.gif')):

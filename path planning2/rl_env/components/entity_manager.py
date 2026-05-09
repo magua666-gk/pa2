@@ -1,8 +1,6 @@
-import random
-import pygame
-import numpy as np
-from rl_env.components.entities import LeaderAgent, FollowerAgent, Obstacle, Goal, Constants
+from rl_env.components.entities import LeaderAgent, FollowerAgent, Obstacle, Goal
 from rl_env.components.position_generator import PositionGenerator
+import math
 
 class EntityManager:
     """Manage all entities in the environment"""
@@ -44,6 +42,9 @@ class EntityManager:
         self.time_counter = 0
         self.images_loaded = False 
         self.goal_reach_radius = 40.0
+        self.formation_distance_threshold = 50.0
+        self.last_formation_fraction = 0.0
+        self.last_all_in_formation = False
         
         # Create entities
         self._create_entities()
@@ -123,6 +124,22 @@ class EntityManager:
         for i, goal in enumerate(self.goals):
             if i < len(positions['goals']):
                 goal.set_position(*positions['goals'][i])
+
+        self._align_initial_formation_motion()
+
+    def _align_initial_formation_motion(self):
+        """Start a newly generated formation with coherent speed and heading."""
+        if not self.leaders:
+            return
+
+        leader = self.leaders[0]
+        if self.goals:
+            goal = self.goals[0]
+            leader.theta = math.atan2(goal.pos_y - leader.pos_y, goal.pos_x - leader.pos_x)
+
+        for follower in self.followers:
+            follower.theta = leader.theta
+            follower.speed = leader.speed
     
     def apply_actions(self, leader_action, follower_actions):
         """Apply structured actions to entities
@@ -195,11 +212,12 @@ class EntityManager:
     def _check_formation(self):
         """Check formation maintenance status"""
         if not self.leaders or not self.followers:
+            self.last_formation_fraction = 0.0
+            self.last_all_in_formation = False
             return
         
-        # Check if all followers maintain formation with leader
-        all_in_formation = True
         leader = self.leaders[0]  # Assume first leader is the leader
+        in_formation_count = 0
         
         # Only keep distance check, remove position relationship condition
         for follower in self.followers:
@@ -207,10 +225,13 @@ class EntityManager:
             distance = follower.distance_to(leader)
             
             # Formation condition: only check distance < 50
-            if distance >= 50:
-                all_in_formation = False
-                break
+            if distance < self.formation_distance_threshold:
+                in_formation_count += 1
         
+        self.last_formation_fraction = in_formation_count / len(self.followers)
+        all_in_formation = in_formation_count == len(self.followers)
+        self.last_all_in_formation = all_in_formation
+
         # Only increase counter when all followers meet the condition
         if all_in_formation:
             self.team_counter += 1
@@ -224,6 +245,8 @@ class EntityManager:
         self.done = False
         self.team_counter = 0
         self.time_counter = 0
+        self.last_formation_fraction = 0.0
+        self.last_all_in_formation = False
         self.images_loaded = False  # Reset image loading status
     
     def is_episode_done(self):
@@ -255,6 +278,14 @@ class EntityManager:
             return 0.0
         
         return self.team_counter / self.time_counter
+
+    def is_currently_in_formation(self):
+        """Return whether all followers are in formation on the latest step."""
+        return bool(self.last_all_in_formation)
+
+    def get_current_formation_fraction(self):
+        """Return the latest-step fraction of followers inside formation range."""
+        return float(self.last_formation_fraction)
     
     def get_agent_distances(self):
         """Get distance matrix between agents
@@ -354,4 +385,4 @@ class EntityManager:
         # Load goal images
         if "goal" in image_dict and self.goals:
             for goal in self.goals:
-                goal.load_image(image_dict["goal"], (30, 30)) 
+                goal.load_image(image_dict["goal"], (30, 30))

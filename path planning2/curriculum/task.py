@@ -1,8 +1,6 @@
 import numpy as np
 import time
-import copy
-import os
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, Any, Optional
 
 class Task:
     """表示课程学习中的一个任务
@@ -64,10 +62,29 @@ class Task:
         
         print(f"创建环境 - 主机: {leader_count}, 从机: {follower_count}, 障碍物: {obstacle_num}")
         
+        def _as_position_list(value):
+            if value is None:
+                return None
+            if isinstance(value, tuple) and len(value) == 2:
+                return [value]
+            if isinstance(value, list):
+                if len(value) == 2 and all(isinstance(item, (int, float)) for item in value):
+                    return [tuple(value)]
+                return value
+            return [value]
+
         # 创建预定义位置字典
         predefined_positions = {}
-        if "goal_init_pos" in self.env_params:
-            predefined_positions["goals"] = self.env_params["goal_init_pos"]
+        position_key_map = {
+            "leader_init_pos": "leaders",
+            "follower_init_pos": "followers",
+            "obstacle_init_pos": "obstacles",
+            "goal_init_pos": "goals",
+        }
+        for source_key, target_key in position_key_map.items():
+            positions = _as_position_list(self.env_params.get(source_key))
+            if positions:
+                predefined_positions[target_key] = positions
         
         # 创建RlGame环境，传入预定义位置
         env = RlGame(leader_count=leader_count, follower_count=follower_count, obstacle_num=obstacle_num, render=render, predefined_positions=predefined_positions)
@@ -91,39 +108,45 @@ class Task:
         
         # 验证实际创建的智能体数量
         initial_state = env.reset()
-        actual_agents = len(initial_state)
+        if isinstance(initial_state, dict):
+            actual_agents = 1 + len(initial_state.get("followers", []))
+        else:
+            actual_agents = len(initial_state)
         if actual_agents != leader_count + follower_count:
             print(f"警告: 环境创建的智能体数量({actual_agents})与请求的数量({leader_count+follower_count})不一致")
             
         # 手动设置固定位置（如果提供）
         if hasattr(env, 'entity_manager'):
             # 设置主机位置
-            if "leader_init_pos" in self.env_params:
+            if "leaders" in predefined_positions:
                 for i, leader in enumerate(env.entity_manager.leaders):
-                    if i < len(self.env_params["leader_init_pos"]):
-                        pos = self.env_params["leader_init_pos"][i]  # 获取第i个位置，这是一个(x,y)元组
+                    if i < len(predefined_positions["leaders"]):
+                        pos = predefined_positions["leaders"][i]  # 获取第i个位置，这是一个(x,y)元组
                         leader.set_position(*pos)  # 解包元组为x,y参数
             
             # 设置从机位置
-            if "follower_init_pos" in self.env_params:
+            if "followers" in predefined_positions:
                 for i, follower in enumerate(env.entity_manager.followers):
-                    if i < len(self.env_params["follower_init_pos"]):
-                        pos = self.env_params["follower_init_pos"][i]  # 获取第i个位置
+                    if i < len(predefined_positions["followers"]):
+                        pos = predefined_positions["followers"][i]  # 获取第i个位置
                         follower.set_position(*pos)  # 解包元组为x,y参数
             
             # 设置目标位置
-            if "goal_init_pos" in self.env_params and env.entity_manager.goals:
+            if "goals" in predefined_positions and env.entity_manager.goals:
                 for i, goal in enumerate(env.entity_manager.goals):
-                    if i < len(self.env_params["goal_init_pos"]):
-                        pos = self.env_params["goal_init_pos"][i]  # 获取第i个位置
+                    if i < len(predefined_positions["goals"]):
+                        pos = predefined_positions["goals"][i]  # 获取第i个位置
                         goal.set_position(*pos)  # 解包元组为x,y参数
             
             # 设置障碍物位置
-            if "obstacle_init_pos" in self.env_params:
+            if "obstacles" in predefined_positions:
                 for i, obstacle in enumerate(env.entity_manager.obstacles):
-                    if i < len(self.env_params["obstacle_init_pos"]):
-                        pos = self.env_params["obstacle_init_pos"][i]  # 获取第i个位置
+                    if i < len(predefined_positions["obstacles"]):
+                        pos = predefined_positions["obstacles"][i]  # 获取第i个位置
                         obstacle.set_position(*pos)  # 解包元组为x,y参数
+
+            if hasattr(env.entity_manager, "_align_initial_formation_motion"):
+                env.entity_manager._align_initial_formation_motion()
             
             # 不再设置无人机速度，使用实体类默认值
             # 领导者(LeaderAgent)初始速度默认为15，速度范围10-20，加速度系数0.3
@@ -396,4 +419,4 @@ class Task:
     
     def __repr__(self):
         """调试表示"""
-        return self.__str__() 
+        return self.__str__()

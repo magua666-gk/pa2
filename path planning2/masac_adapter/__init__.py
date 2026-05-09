@@ -1,7 +1,7 @@
 from .masac_adapter import (
     MASACAdapter, MultiHeadAttention,
     set_log_level, LOG_ERROR, LOG_WARNING, LOG_INFO, LOG_DEBUG, clear_log_history,
-    LEADER_TYPE_ID, FOLLOWER_TYPE_ID, Entroy as MASACEntroy, log
+    LEADER_TYPE_ID, FOLLOWER_TYPE_ID, MASACEntroy, log
 )
 from .agent_pool import AgentPool
 from .smer_memory import SMERMemory
@@ -16,4 +16,4 @@ __all__ = [
     'log', 'clear_log_history', 'LEADER_TYPE_ID', 'FOLLOWER_TYPE_ID', 'MASACEntroy',
     'RoleEmbedding', 'PolicyNetFlatRole', 'SharedEncoder', 'QHead', 'CriticNetAttentionFlat',
     'AdapterMASACController'
-] 
+]
